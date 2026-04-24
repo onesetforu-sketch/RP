@@ -1044,6 +1044,42 @@ def _parse_token_error(err):
         return "live", "Insufficient Funds (Live)"
     elif "pin" in check and ("incorrect" in check or "invalid" in check or "tries" in check):
         return "declined", "PIN Error"
+    elif "merchant_blacklist" in check:
+        return "declined", "Merchant Blacklisted"
+    elif "generic_decline" in check:
+        return "declined", "Generic Decline"
+    elif "no_action_taken" in check:
+        return "declined", "No Action Taken"
+    elif "reenter_transaction" in check:
+        return "declined", "Re-enter Transaction"
+    elif "invalid_account" in check:
+        return "declined", "Invalid Account"
+    elif "stop_payment_order" in check:
+        return "declined", "Stop Payment Order"
+    elif "refer_to_card_issuer" in check or "refer_to_issuer" in check:
+        return "declined", "Refer to Card Issuer"
+    elif "allowable_number_of_pin_tries_exceeded" in check or "pin_tries_exceeded" in check:
+        return "declined", "PIN Tries Exceeded"
+    elif "offline_pin_required" in check:
+        return "declined", "Offline PIN Required"
+    elif "online_or_offline_pin_required" in check:
+        return "declined", "PIN Required"
+    elif "exceeds_approval_amount_limit" in check:
+        return "live", "Exceeds Limit (Live)"
+    elif "card_not_supported" in check:
+        return "declined", "Card Not Supported"
+    elif "invalid_pin" in check:
+        return "declined", "Invalid PIN"
+    elif "testmode_decline" in check or "test_mode" in check:
+        return "declined", "Test Mode Decline"
+    elif "resource_missing" in check:
+        return "error", "Resource Missing (Gate Error)"
+    elif "rate_limit" in check:
+        return "error", "Rate Limited"
+    elif "api_key_expired" in check or "invalid_api_key" in check:
+        return "error", "Invalid/Expired API Key"
+    elif "parameter_missing" in check:
+        return "error", "Missing Parameter (Gate Error)"
     else:
         return "declined", msg[:80] if msg else "Card Declined"
 
@@ -1234,7 +1270,13 @@ def detect_gate_type(full_url):
     s = _make_session()
     try:
         try:
-            r = s.get(full_url, verify=False, timeout=15, allow_redirects=True)
+            r = s.get(full_url, verify=False, timeout=20, allow_redirects=True)
+        except requests.exceptions.SSLError:
+            try:
+                alt = full_url.replace("https://", "http://") if full_url.startswith("https://") else full_url
+                r = s.get(alt, verify=False, timeout=15, allow_redirects=True)
+            except Exception:
+                return result
         except Exception:
             return result
 
@@ -1261,6 +1303,24 @@ def detect_gate_type(full_url):
         if 'stripe.js' in html or 'js.stripe.com' in html:
             stripe_signals += 2
             result["signals"].append("stripe.js")
+        if 'give-form' in html or 'givewp' in html:
+            stripe_signals += 2
+            result["signals"].append("GiveWP form")
+        if 'donorbox' in html:
+            stripe_signals += 2
+            result["signals"].append("Donorbox")
+        if 'funraise' in html:
+            stripe_signals += 2
+            result["signals"].append("Funraise")
+        if 'stripe-element' in html or 'card-element' in html:
+            stripe_signals += 2
+            result["signals"].append("Stripe Elements")
+        if 'stripe.elements' in html or 'stripeelements' in html:
+            stripe_signals += 2
+            result["signals"].append("Stripe Elements JS")
+        if 'acct_' in html:
+            stripe_signals += 1
+            result["signals"].append("Stripe account ID")
 
         if 'braintree' in html:
             braintree_signals += 2
@@ -1274,6 +1334,9 @@ def detect_gate_type(full_url):
         if 'braintree.js' in html or 'braintree-web' in html:
             braintree_signals += 2
             result["signals"].append("braintree.js")
+        if 'paypal' in html and 'braintree' in html:
+            braintree_signals += 1
+            result["signals"].append("PayPal+BT")
 
         if stripe_signals > braintree_signals:
             result["gate_type"] = "stripe"
@@ -1293,6 +1356,68 @@ def detect_gate_type(full_url):
     return result
 
 
+def _detect_form_type(page_html, soup):
+    html_lower = page_html.lower()
+
+    if '_charitable_donation_nonce' in page_html:
+        nonce_el = soup.find('input', {'name': '_charitable_donation_nonce'})
+        form_id_el = soup.find('input', {'name': 'charitable_form_id'})
+        if nonce_el and form_id_el:
+            return "charitable", "Charitable form (DOM)"
+        nonce_match = re.search(r'_charitable_donation_nonce["\s]+value=["\']([^"\']+)', page_html)
+        form_match = re.search(r'charitable_form_id["\s]+value=["\']([^"\']+)', page_html)
+        if nonce_match and form_match:
+            return "charitable", "Charitable form (regex)"
+
+    if 'give-form' in html_lower or 'give_action' in html_lower or 'give-donation' in html_lower:
+        return "givewp", "GiveWP donation form"
+
+    if 'donorbox' in html_lower or 'donorbox.org' in html_lower:
+        return "donorbox", "Donorbox embed"
+
+    if 'funraise' in html_lower or 'funraise.org' in html_lower:
+        return "funraise", "Funraise donation form"
+
+    if 'every.org' in html_lower or 'everyaction' in html_lower:
+        return "everyaction", "EveryAction/Every.org form"
+
+    if 'salesforce' in html_lower or 'force.com' in html_lower:
+        return "salesforce", "Salesforce donation page"
+
+    if 'woocommerce' in html_lower or 'wc-checkout' in html_lower:
+        return "woocommerce", "WooCommerce checkout"
+
+    if 'giveasyoulive' in html_lower:
+        return "giveasyoulive", "Give As You Live form"
+
+    stripe_indicators = [
+        'stripe.js', 'js.stripe.com', 'stripe-element', 'stripe_publishable',
+        'pk_live_', 'pk_test_', 'data-stripe', 'stripe-card-element',
+        'StripeElements', 'stripe.elements', 'card-element',
+    ]
+    if any(ind in page_html for ind in stripe_indicators):
+        forms = soup.find_all('form')
+        for form in forms:
+            action = (form.get('action') or '').lower()
+            if any(kw in action for kw in ['donate', 'donation', 'give', 'payment', 'checkout', 'process']):
+                return "stripe_generic", f"Stripe form ({action[:40]})"
+            inputs = form.find_all('input')
+            input_names = [i.get('name', '').lower() for i in inputs]
+            if any('amount' in n or 'donation' in n or 'payment' in n for n in input_names):
+                return "stripe_generic", f"Stripe payment form"
+        return "stripe_generic", "Stripe Elements detected"
+
+    donate_forms = soup.find_all('form')
+    for form in donate_forms:
+        action = (form.get('action') or '').lower()
+        classes = ' '.join(form.get('class', []) or []).lower()
+        form_id = (form.get('id') or '').lower()
+        if any(kw in f"{action} {classes} {form_id}" for kw in ['donat', 'give', 'contribut', 'payment']):
+            return "generic_donate", f"Generic donation form"
+
+    return None, None
+
+
 def setup_gate_from_url(full_url):
     from config import set_gate_setting as _set_gs, get_all_gate_settings
 
@@ -1304,6 +1429,7 @@ def setup_gate_from_url(full_url):
         "campaign_id": "",
         "stripe_account": "",
         "form_found": False,
+        "form_type": "",
         "pow_required": False,
         "pow_solved": False,
         "errors": [],
@@ -1319,8 +1445,13 @@ def setup_gate_from_url(full_url):
     parsed = urlparse(full_url)
     site_url = f"{parsed.scheme}://{parsed.netloc}"
     donate_path = parsed.path if parsed.path and parsed.path != "/" else "/donate/"
-    if not donate_path.endswith("/") and "." not in donate_path.split("/")[-1]:
+    query_string = parsed.query
+    if query_string:
+        donate_path = f"{donate_path}?{query_string}"
+    elif not donate_path.endswith("/") and "." not in donate_path.split("/")[-1]:
         donate_path += "/"
+    if parsed.fragment:
+        donate_path = f"{donate_path}#{parsed.fragment}"
 
     results["site_url"] = site_url
     results["donate_path"] = donate_path
@@ -1329,10 +1460,31 @@ def setup_gate_from_url(full_url):
     new_settings = {}
     try:
         try:
-            r = s.get(site_url, verify=False, timeout=15, allow_redirects=True)
-            if r.status_code != 200:
-                results["errors"].append(f"Site returned HTTP {r.status_code}")
+            r = s.get(full_url, verify=False, timeout=20, allow_redirects=True)
+            if r.status_code in (403, 503):
+                results["errors"].append(f"Site blocked/unavailable (HTTP {r.status_code})")
                 return results
+            if r.status_code == 404:
+                r = s.get(site_url, verify=False, timeout=15, allow_redirects=True)
+                if r.status_code != 200:
+                    results["errors"].append(f"Site returned HTTP {r.status_code}")
+                    return results
+        except requests.exceptions.SSLError:
+            try:
+                if full_url.startswith("https://"):
+                    alt_url = full_url.replace("https://", "http://")
+                    r = s.get(alt_url, verify=False, timeout=15, allow_redirects=True)
+                else:
+                    raise
+            except Exception as e2:
+                results["errors"].append(f"SSL error & HTTP fallback failed: {str(e2)[:50]}")
+                return results
+        except requests.exceptions.Timeout:
+            results["errors"].append("Connection timed out (20s)")
+            return results
+        except requests.exceptions.ConnectionError as e:
+            results["errors"].append(f"Connection failed: {str(e)[:50]}")
+            return results
         except Exception as e:
             results["errors"].append(f"Cannot reach site: {str(e)[:60]}")
             return results
@@ -1340,41 +1492,69 @@ def setup_gate_from_url(full_url):
         results["auto_detected"].append(f"Site URL: {site_url}")
         new_settings["site_url"] = site_url
 
-        donate_url = f"{site_url}{donate_path}"
-        try:
-            r2 = s.get(donate_url, verify=False, timeout=20, allow_redirects=True)
-            if r2.status_code == 404:
-                common_paths = ["/donate/", "/donations/", "/give/", "/support/", "/contribute/", "/donation/"]
-                found = False
-                for path in common_paths:
-                    if path == donate_path:
-                        continue
-                    try:
-                        test_r = s.get(f"{site_url}{path}", verify=False, timeout=10, allow_redirects=True)
-                        if test_r.status_code == 200 and ('charitable' in test_r.text.lower() or 'donation' in test_r.text.lower() or 'stripe' in test_r.text.lower()):
-                            donate_path = path
-                            results["donate_path"] = path
-                            results["auto_detected"].append(f"Donate path: {path} (auto-found)")
-                            r2 = test_r
-                            found = True
-                            break
-                    except Exception:
-                        continue
-                if not found:
-                    results["errors"].append(f"Donate page not found at {donate_path} or common paths")
+        page_html = r.text
+        final_url = r.url
+        if final_url and str(final_url) != full_url:
+            new_parsed = urlparse(str(final_url))
+            if new_parsed.netloc != parsed.netloc:
+                site_url = f"{new_parsed.scheme}://{new_parsed.netloc}"
+                new_settings["site_url"] = site_url
+                results["site_url"] = site_url
+                results["auto_detected"].append(f"Redirected to: {site_url}")
+            redir_path = new_parsed.path
+            if redir_path and redir_path != "/":
+                donate_path = redir_path
+                if new_parsed.query:
+                    donate_path = f"{redir_path}?{new_parsed.query}"
+                if not donate_path.endswith("/") and "." not in donate_path.split("/")[-1]:
+                    donate_path += "/"
+                results["donate_path"] = donate_path
+
+        if r.status_code == 200 and ('donate' in page_html.lower() or 'stripe' in page_html.lower()
+                                     or 'payment' in page_html.lower() or 'give' in page_html.lower()):
+            r2 = r
+        else:
+            donate_url = f"{site_url}{donate_path}" if "?" not in donate_path else full_url
+            try:
+                r2 = s.get(donate_url, verify=False, timeout=20, allow_redirects=True)
+                if r2.status_code == 404:
+                    common_paths = ["/donate/", "/donations/", "/give/", "/support/",
+                                    "/contribute/", "/donation/", "/donate-online/",
+                                    "/make-a-donation/", "/donate-now/"]
+                    found = False
+                    for path in common_paths:
+                        if path == donate_path:
+                            continue
+                        try:
+                            test_r = s.get(f"{site_url}{path}", verify=False, timeout=10,
+                                           allow_redirects=True)
+                            if test_r.status_code == 200:
+                                tl = test_r.text.lower()
+                                if any(kw in tl for kw in ['charitable', 'donation', 'stripe',
+                                                           'donate', 'give', 'payment']):
+                                    donate_path = path
+                                    results["donate_path"] = path
+                                    results["auto_detected"].append(f"Donate path: {path} (auto-found)")
+                                    r2 = test_r
+                                    found = True
+                                    break
+                        except Exception:
+                            continue
+                    if not found:
+                        results["errors"].append(f"Donate page not found at {donate_path}")
+                        return results
+                elif r2.status_code != 200:
+                    results["errors"].append(f"Donate page HTTP {r2.status_code}")
                     return results
-            elif r2.status_code != 200:
-                results["errors"].append(f"Donate page HTTP {r2.status_code}")
+                else:
+                    results["auto_detected"].append(f"Donate path: {donate_path}")
+            except Exception as e:
+                results["errors"].append(f"Cannot reach donate page: {str(e)[:60]}")
                 return results
-            else:
-                results["auto_detected"].append(f"Donate path: {donate_path}")
-        except Exception as e:
-            results["errors"].append(f"Cannot reach donate page: {str(e)[:60]}")
-            return results
+
+            page_html = r2.text
 
         new_settings["donate_path"] = donate_path
-
-        page_html = r2.text
 
         if 'pow_nonce' in page_html or 'Verifying' in page_html or 'not a bot' in page_html:
             results["pow_required"] = True
@@ -1388,23 +1568,50 @@ def setup_gate_from_url(full_url):
 
         soup = BeautifulSoup(page_html, 'html.parser')
 
-        nonce_el = soup.find('input', {'name': '_charitable_donation_nonce'})
-        form_id_el = soup.find('input', {'name': 'charitable_form_id'})
+        form_type, form_desc = _detect_form_type(page_html, soup)
+        if form_type:
+            results["form_found"] = True
+            results["form_type"] = form_type
+            results["auto_detected"].append(f"Form: {form_desc}")
+        else:
+            results["errors"].append("No donation form detected")
+
         campaign_el = soup.find('input', {'name': 'campaign_id'})
 
-        if nonce_el and form_id_el:
-            results["form_found"] = True
-            results["auto_detected"].append("Charitable form: detected")
-        else:
-            nonce_match = re.search(r'_charitable_donation_nonce["\s]+value=["\']([^"\']+)', page_html)
-            form_match = re.search(r'charitable_form_id["\s]+value=["\']([^"\']+)', page_html)
-            if nonce_match and form_match:
-                results["form_found"] = True
-                results["auto_detected"].append("Charitable form: detected (regex)")
-            else:
-                results["errors"].append("Charitable donation form not found")
-
         pk = _extract_stripe_key(page_html)
+
+        if not pk:
+            pk_patterns_extended = [
+                r'"publishable_key"\s*:\s*"(pk_live_[^"]+)"',
+                r'"stripePublishableKey"\s*:\s*"(pk_live_[^"]+)"',
+                r'"STRIPE_PUBLIC_KEY"\s*:\s*"(pk_live_[^"]+)"',
+                r'data-key="(pk_live_[^"]+)"',
+                r"stripe_key\s*[=:]\s*['\"]?(pk_live_[A-Za-z0-9_]+)",
+                r"NEXT_PUBLIC_STRIPE[^=]*=\s*['\"]?(pk_live_[A-Za-z0-9_]+)",
+            ]
+            for pat in pk_patterns_extended:
+                m = re.search(pat, page_html)
+                if m:
+                    pk = m.group(1)
+                    break
+
+        if not pk:
+            script_tags = soup.find_all('script', src=True)
+            for script in script_tags[:10]:
+                src = script.get('src', '')
+                if 'stripe' in src.lower() or 'donate' in src.lower() or 'payment' in src.lower():
+                    try:
+                        js_url = src if src.startswith('http') else f"{site_url}{src}"
+                        js_r = s.get(js_url, verify=False, timeout=10)
+                        if js_r.status_code == 200:
+                            js_pk = _extract_stripe_key(js_r.text)
+                            if js_pk:
+                                pk = js_pk
+                                results["auto_detected"].append(f"Key found in: {src[:40]}")
+                                break
+                    except Exception:
+                        continue
+
         if pk:
             new_settings["pub_key"] = pk
             results["stripe_key"] = pk[:25] + "..."
@@ -1413,25 +1620,52 @@ def setup_gate_from_url(full_url):
             results["errors"].append("No Stripe key found - set manually via /setgate key [key]")
 
         if campaign_el:
-            cid = campaign_el.get('value', '')
-            if cid:
-                new_settings["campaign_id"] = cid
-                results["campaign_id"] = cid
-                results["auto_detected"].append(f"Campaign ID: {cid}")
+            cid_val = campaign_el.get('value', '')
+            if cid_val:
+                new_settings["campaign_id"] = cid_val
+                results["campaign_id"] = cid_val
+                results["auto_detected"].append(f"Campaign ID: {cid_val}")
 
-        acct_match = re.search(r'"stripeAccountId":"(acct_[^"]+)"', page_html) or \
-                     re.search(r'"accountId":"(acct_[^"]+)"', page_html) or \
-                     re.search(r'"stripe_account":"(acct_[^"]+)"', page_html)
-        if acct_match:
-            acct_id = acct_match.group(1)
-            new_settings["stripe_account"] = acct_id
-            results["stripe_account"] = acct_id
-            results["auto_detected"].append(f"Stripe account: {acct_id}")
+        acct_patterns = [
+            r'"stripeAccountId"\s*:\s*"(acct_[^"]+)"',
+            r'"accountId"\s*:\s*"(acct_[^"]+)"',
+            r'"stripe_account"\s*:\s*"(acct_[^"]+)"',
+            r'"stripeConnectAccountId"\s*:\s*"(acct_[^"]+)"',
+            r"acct_[A-Za-z0-9]{10,}",
+        ]
+        for pat in acct_patterns[:-1]:
+            acct_match = re.search(pat, page_html)
+            if acct_match:
+                acct_id = acct_match.group(1)
+                new_settings["stripe_account"] = acct_id
+                results["stripe_account"] = acct_id
+                results["auto_detected"].append(f"Stripe account: {acct_id}")
+                break
+        else:
+            raw_acct = re.search(acct_patterns[-1], page_html)
+            if raw_acct:
+                acct_id = raw_acct.group(0)
+                new_settings["stripe_account"] = acct_id
+                results["stripe_account"] = acct_id
+                results["auto_detected"].append(f"Stripe account: {acct_id}")
 
-        if results["form_found"] and pk:
+        has_stripe = pk is not None
+        has_form = results["form_found"]
+
+        if has_stripe and has_form:
             results["success"] = True
             for k, v in new_settings.items():
                 _set_gs("stripe", k, v)
+        elif has_stripe and not has_form:
+            results["success"] = True
+            results["auto_detected"].append("No form but Stripe key found — gate usable")
+            for k, v in new_settings.items():
+                _set_gs("stripe", k, v)
+        elif has_form and not has_stripe:
+            results["errors"].append("Form found but no Stripe key — set key manually")
+            for k, v in new_settings.items():
+                if v:
+                    _set_gs("stripe", k, v)
         else:
             results["errors"].append("Setup incomplete - previous gate settings preserved")
 

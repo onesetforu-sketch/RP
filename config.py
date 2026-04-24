@@ -62,6 +62,190 @@ GATE_SETTINGS = {
 
 MAX_CONFIGS = 5
 
+GATE_URLS = [
+    "https://www.bristol.ac.uk/alumni/donate/make-a-donation/",
+    "https://austincommunitysteelband.org/donate-online/",
+    "https://www.educationsuccessfoundation.org/donate",
+    "https://grandfoundation.com/Donate/Policy",
+    "https://donate.youngfeministfund.org/give/271113/#!/donation/checkout",
+    "https://caritascommunities.org/support-us-2/donate/",
+    "https://shangpakagyu.org/donate/",
+    "https://launch.umd.edu/project/43212/donate?amount=50&lvid=121338",
+    "https://act.dsausa.org/donate/donation",
+    "https://msf.org.uk/secure/donate/urgent",
+    "https://www.gogirlghana.org/donate/",
+    "https://act.thesyriacampaign.org/donate/donate-to-tsc-donate/",
+    "https://www.healthpointfoundation.org/donate/",
+    "https://www.wearelumos.org/how-you-can-help/donate/",
+    "https://literacytrust.org.uk/donate/one-off/",
+    "https://go-donate.uk/products/inmem/",
+    "https://libdems.my.salesforce-sites.com/DonationPage/donation/2211-donate",
+    "https://www.themarginalian.org/donate/privacy-terms/",
+    "https://ccfboston.org/donate/",
+    "https://justwinfc.com/donate",
+    "https://clarkmck.org/donate/",
+    "https://en.unav.edu/web/global-affairs/donate",
+    "https://www.quincyfamilyrc.org/donate/",
+    "https://chesshomeless.org/donate-food-and-goods/",
+    "https://turningpointrecoverycenter.org/donate/",
+    "https://www.gwct.org.uk/donate/raffles/the-best-of-essex-raffle/",
+    "https://www.devannacenter.org/donate/",
+    "https://donate.giveasyoulive.com/donate?cid=119584",
+    "https://www.oldcolonymontessori.org/donate",
+    "https://www.cancerhaircare.co.uk/how-to-donate/",
+    "https://sthelena.org.uk/how-you-can-help-us/donate/leave-a-gift-in-your-will/wills-month",
+    "https://defendinnocence.org/de/donate-lassen-sie-uns-einen-unterschied-machen/",
+    "https://www.propfaithboston.org/donate-to-propagation-of-the-faith",
+    "http://www.cfa.vic.gov.au/about-us/fundraising-and-partnerships/donate-to-cfa",
+    "https://findinghope.org/donate/",
+    "https://iffgd.org/get-involved/make-a-donation/donate-form/",
+    "https://uk.movember.com/donate/general?rec_freq=monthly&mocamp=rg",
+]
+
+_gate_pool = {}
+_gate_pool_order = []
+_gate_pool_index = 0
+
+
+def _init_gate_pool():
+    global _gate_pool, _gate_pool_order, _gate_pool_index
+    for url in GATE_URLS:
+        _gate_pool[url] = {
+            "status": "pending",
+            "gate_type": None,
+            "confidence": None,
+            "errors": [],
+            "success_count": 0,
+            "fail_count": 0,
+            "last_used": 0,
+            "last_error": "",
+            "health_score": 100,
+            "setup_result": None,
+        }
+    _gate_pool_order = list(GATE_URLS)
+    _gate_pool_index = 0
+
+_init_gate_pool()
+
+
+def get_gate_pool():
+    return copy.deepcopy(_gate_pool)
+
+
+def get_gate_pool_stats():
+    ready = sum(1 for g in _gate_pool.values() if g["status"] == "ready")
+    failed = sum(1 for g in _gate_pool.values() if g["status"] == "failed")
+    pending = sum(1 for g in _gate_pool.values() if g["status"] == "pending")
+    testing = sum(1 for g in _gate_pool.values() if g["status"] == "testing")
+    return {
+        "total": len(_gate_pool),
+        "ready": ready,
+        "failed": failed,
+        "pending": pending,
+        "testing": testing,
+    }
+
+
+def update_gate_pool_entry(url, status=None, gate_type=None, confidence=None,
+                           error=None, setup_result=None):
+    if url not in _gate_pool:
+        return False
+    entry = _gate_pool[url]
+    if status:
+        entry["status"] = status
+    if gate_type:
+        entry["gate_type"] = gate_type
+    if confidence:
+        entry["confidence"] = confidence
+    if error:
+        entry["errors"].append(error)
+        entry["last_error"] = error
+        entry["fail_count"] += 1
+        entry["health_score"] = max(0, entry["health_score"] - 25)
+    if setup_result is not None:
+        entry["setup_result"] = setup_result
+    return True
+
+
+def record_gate_success(url):
+    if url in _gate_pool:
+        entry = _gate_pool[url]
+        entry["success_count"] += 1
+        entry["last_used"] = int(time.time())
+        entry["health_score"] = min(100, entry["health_score"] + 5)
+
+
+def record_gate_failure(url, error=""):
+    if url in _gate_pool:
+        entry = _gate_pool[url]
+        entry["fail_count"] += 1
+        entry["last_error"] = error
+        entry["health_score"] = max(0, entry["health_score"] - 15)
+        if entry["health_score"] <= 0:
+            entry["status"] = "dead"
+
+
+def get_next_ready_gate():
+    global _gate_pool_index
+    ready_urls = [u for u in _gate_pool_order
+                  if _gate_pool.get(u, {}).get("status") == "ready"
+                  and _gate_pool.get(u, {}).get("health_score", 0) > 0]
+    if not ready_urls:
+        return None
+    ready_urls.sort(key=lambda u: _gate_pool[u]["health_score"], reverse=True)
+    chosen = ready_urls[0]
+    _gate_pool[chosen]["last_used"] = int(time.time())
+    return chosen
+
+
+def get_ready_gate_count():
+    return sum(1 for g in _gate_pool.values()
+               if g["status"] == "ready" and g["health_score"] > 0)
+
+
+def add_gate_url(url):
+    url = url.strip()
+    if url in _gate_pool:
+        return False, "URL already in pool"
+    GATE_URLS.append(url)
+    _gate_pool[url] = {
+        "status": "pending",
+        "gate_type": None,
+        "confidence": None,
+        "errors": [],
+        "success_count": 0,
+        "fail_count": 0,
+        "last_used": 0,
+        "last_error": "",
+        "health_score": 100,
+        "setup_result": None,
+    }
+    _gate_pool_order.append(url)
+    return True, "Added"
+
+
+def remove_gate_url(url):
+    url = url.strip()
+    if url not in _gate_pool:
+        return False
+    del _gate_pool[url]
+    if url in _gate_pool_order:
+        _gate_pool_order.remove(url)
+    if url in GATE_URLS:
+        GATE_URLS.remove(url)
+    return True
+
+
+def reset_gate_pool():
+    global _gate_pool_index
+    for url in _gate_pool:
+        _gate_pool[url]["status"] = "pending"
+        _gate_pool[url]["errors"] = []
+        _gate_pool[url]["health_score"] = 100
+        _gate_pool[url]["last_error"] = ""
+    _gate_pool_index = 0
+
+
 _gate_configs = {
     1: {
         "name": "Stripe Gate",
