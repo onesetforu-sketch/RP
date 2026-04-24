@@ -23,7 +23,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proxy_scraper import full_scrape_and_scrub, auto_scrub_loop, get_scrub_stats, get_scrubbed_proxies, proxy_pool_monitor, get_live_count, remove_dead_proxy, get_proxy_latency, TARGET_LIVE, REFILL_THRESHOLD, MAX_WORKERS
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_CODE, TELEGRAM_ADMIN, STRIPE_PUB_KEY, get_proxy_dict, load_proxies, get_proxy_stats, get_pool_size, blacklist_proxy, clear_blacklist, set_gate_setting, get_all_gate_settings, is_gate_enabled, set_gate_enabled, get_notify, set_notify, get_all_notify, set_custom_chat_id, get_custom_chat_id, is_proxy_enabled, set_proxy_enabled, add_custom_proxy, remove_custom_proxy, get_custom_proxies, clear_custom_proxies, has_custom_proxies, get_config, get_all_configs, get_active_config_id, set_active_config, create_config, duplicate_config, delete_config, enable_config, disable_config, set_config_setting, set_config_name, get_config_stats, update_config_stats, get_enabled_configs, is_parallel_enabled, set_parallel_enabled, config_count, generate_redeem_key, redeem_key, get_all_redeem_keys, revoke_redeem_key, is_user_redeemed, cleanup_expired_keys, add_admin, remove_admin, get_all_admins, is_extra_admin, get_config_gate_type, set_config_gate_type, get_gate_setting, track_user_card, get_user_cards, get_user_card_file, clear_user_cards, get_user_check_count, increment_user_check_count, check_user_card_limit, get_user_limit, set_user_limit, get_all_user_limits, export_config_data, import_config_data, GATE_URLS, get_gate_pool, get_gate_pool_stats, update_gate_pool_entry, record_gate_success, record_gate_failure, get_next_ready_gate, get_ready_gate_count, add_gate_url, remove_gate_url, reset_gate_pool
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_CODE, TELEGRAM_ADMIN, STRIPE_PUB_KEY, get_proxy_dict, load_proxies, get_proxy_stats, get_pool_size, blacklist_proxy, clear_blacklist, set_gate_setting, get_all_gate_settings, is_gate_enabled, set_gate_enabled, get_notify, set_notify, get_all_notify, set_custom_chat_id, get_custom_chat_id, is_proxy_enabled, set_proxy_enabled, add_custom_proxy, remove_custom_proxy, get_custom_proxies, clear_custom_proxies, has_custom_proxies, get_config, get_all_configs, get_active_config_id, set_active_config, create_config, duplicate_config, delete_config, enable_config, disable_config, set_config_setting, set_config_name, get_config_stats, update_config_stats, get_enabled_configs, is_parallel_enabled, set_parallel_enabled, config_count, generate_redeem_key, redeem_key, get_all_redeem_keys, revoke_redeem_key, is_user_redeemed, cleanup_expired_keys, add_admin, remove_admin, get_all_admins, is_extra_admin, get_config_gate_type, set_config_gate_type, get_gate_setting, track_user_card, get_user_cards, get_user_card_file, clear_user_cards, get_user_check_count, increment_user_check_count, check_user_card_limit, get_user_limit, set_user_limit, get_all_user_limits, export_config_data, import_config_data, GATE_URLS, get_gate_pool, get_gate_pool_stats, update_gate_pool_entry, record_gate_success, record_gate_failure, get_next_ready_gate, get_ready_gate_count, add_gate_url, remove_gate_url, reset_gate_pool, find_gate_pool_url_by_site
 from stripe import get_rate_limiter, diagnose_gate, setup_gate_from_url, detect_gate_type
 from braintree_gate import check_braintree, setup_braintree_from_url
 from smart_gen import init_smart_gen, generate_card_lstm, generate_smart_batch, retrain as retrain_smart_gen
@@ -3433,9 +3433,9 @@ def register_handlers(dp):
                     "<code>━━ H@0 ━━</code>",
                     parse_mode='HTML'
                 )
-                active_gate_url = get_gate_setting(active_gt, "site_url", "")
-                if active_gate_url:
-                    record_gate_success(active_gate_url)
+                pool_url = find_gate_pool_url_by_site(get_gate_setting(active_gt, "site_url", ""))
+                if pool_url:
+                    record_gate_success(pool_url)
             else:
                 await message.reply(
                     "<b>🧪  TEST RESULT</b>\n"
@@ -3456,15 +3456,15 @@ def register_handlers(dp):
                     "<code>━━ H@0 ━━</code>",
                     parse_mode='HTML'
                 )
-                active_gate_url = get_gate_setting(active_gt, "site_url", "")
-                if active_gate_url:
-                    record_gate_success(active_gate_url)
+                pool_url = find_gate_pool_url_by_site(get_gate_setting(active_gt, "site_url", ""))
+                if pool_url:
+                    record_gate_success(pool_url)
 
         except Exception as e:
             logger.error(f"Testcard error: {e}")
-            active_gate_url = get_gate_setting(active_gt, "site_url", "")
-            if active_gate_url:
-                record_gate_failure(active_gate_url, str(e)[:60])
+            pool_url = find_gate_pool_url_by_site(get_gate_setting(active_gt, "site_url", ""))
+            if pool_url:
+                record_gate_failure(pool_url, str(e)[:60])
 
             await message.reply(
                 "<b>❌  TEST FAILED</b>\n"

@@ -236,6 +236,16 @@ def remove_gate_url(url):
     return True
 
 
+def find_gate_pool_url_by_site(site_url):
+    if not site_url:
+        return None
+    site_url = site_url.rstrip("/")
+    for url in _gate_pool_order:
+        if url.startswith(site_url + "/") or url.startswith(site_url + "?") or url == site_url:
+            return url
+    return None
+
+
 def reset_gate_pool():
     global _gate_pool_index
     for url in _gate_pool:

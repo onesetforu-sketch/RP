@@ -1393,9 +1393,9 @@ def _detect_form_type(page_html, soup):
     stripe_indicators = [
         'stripe.js', 'js.stripe.com', 'stripe-element', 'stripe_publishable',
         'pk_live_', 'pk_test_', 'data-stripe', 'stripe-card-element',
-        'StripeElements', 'stripe.elements', 'card-element',
+        'stripeelements', 'stripe.elements', 'card-element',
     ]
-    if any(ind in page_html for ind in stripe_indicators):
+    if any(ind in html_lower for ind in stripe_indicators):
         forms = soup.find_all('form')
         for form in forms:
             action = (form.get('action') or '').lower()
@@ -1514,7 +1514,7 @@ def setup_gate_from_url(full_url):
                                      or 'payment' in page_html.lower() or 'give' in page_html.lower()):
             r2 = r
         else:
-            donate_url = f"{site_url}{donate_path}" if "?" not in donate_path else full_url
+            donate_url = f"{site_url}{donate_path}"
             try:
                 r2 = s.get(donate_url, verify=False, timeout=20, allow_redirects=True)
                 if r2.status_code == 404:
