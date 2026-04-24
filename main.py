@@ -9,6 +9,26 @@ import random
 import logging
 import re
 
+
+def _require_aiogram_v2():
+    """This bot is written for aiogram v2. Fail fast on v3 with a clear message."""
+    ver = getattr(aiogram, "__version__", "0")
+    try:
+        major = int(str(ver).split(".", 1)[0])
+    except (ValueError, AttributeError):
+        major = 0
+    if major >= 3:
+        sys.stderr.write(
+            "\n[FATAL] This bot requires aiogram v2.x (installed: {ver}).\n"
+            "        aiogram v3 is a breaking rewrite and is NOT supported.\n"
+            "        Fix:  pip install --upgrade 'aiogram>=2.25,<3'\n"
+            "        (or:  pip install -r requirements.txt)\n\n".format(ver=ver)
+        )
+        sys.exit(1)
+
+
+_require_aiogram_v2()
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
