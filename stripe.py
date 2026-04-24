@@ -1506,7 +1506,7 @@ def setup_gate_from_url(full_url):
                 donate_path = redir_path
                 if new_parsed.query:
                     donate_path = f"{redir_path}?{new_parsed.query}"
-                if not donate_path.endswith("/") and "." not in donate_path.split("/")[-1]:
+                elif not donate_path.endswith("/") and "." not in donate_path.split("/")[-1]:
                     donate_path += "/"
                 results["donate_path"] = donate_path
 

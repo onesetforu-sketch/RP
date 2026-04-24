@@ -3204,6 +3204,8 @@ def register_handlers(dp):
         ready_count = 0
         fail_count = 0
         first_ready_url = None
+        first_ready_settings = None
+        first_ready_gate_type = None
 
         for i, url in enumerate(GATE_URLS):
             if not _autogates_running:
@@ -3230,11 +3232,12 @@ def register_handlers(dp):
                     ready_count += 1
                     if first_ready_url is None:
                         first_ready_url = url
+                        first_ready_gate_type = detected_type
+                        first_ready_settings = get_all_gate_settings(detected_type).copy()
                         active_cid = get_active_config_id()
-                        settings = get_all_gate_settings(detected_type)
-                        for k, v in settings.items():
-                            set_config_setting(active_cid, k, v)
                         set_config_gate_type(active_cid, detected_type)
+                        for k, v in first_ready_settings.items():
+                            set_config_setting(active_cid, k, v)
                         enable_config(active_cid)
                         set_gate_enabled(detected_type, True)
                 else:
@@ -3260,6 +3263,12 @@ def register_handlers(dp):
                     )
                 except Exception:
                     pass
+
+        if first_ready_settings and first_ready_gate_type:
+            active_cid = get_active_config_id()
+            set_config_gate_type(active_cid, first_ready_gate_type)
+            for k, v in first_ready_settings.items():
+                set_config_setting(active_cid, k, v)
 
         _autogates_running = False
 
