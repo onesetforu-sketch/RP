@@ -3286,117 +3286,119 @@ def register_handlers(dp):
         first_ready_settings = None
         first_ready_gate_type = None
 
-        for i, url in enumerate(GATE_URLS):
-            if not _autogates_running:
-                break
+        try:
+            for i, url in enumerate(GATE_URLS):
+                if not _autogates_running:
+                    break
 
-            update_gate_pool_entry(url, status="testing")
+                update_gate_pool_entry(url, status="testing")
 
-            try:
-                gate_info = await loop.run_in_executor(None, detect_gate_type, url)
-                detected_type = gate_info.get("gate_type", "stripe")
-                confidence = gate_info.get("confidence", "low")
+                try:
+                    gate_info = await loop.run_in_executor(None, detect_gate_type, url)
+                    detected_type = gate_info.get("gate_type", "stripe")
+                    confidence = gate_info.get("confidence", "low")
 
-                update_gate_pool_entry(url, gate_type=detected_type, confidence=confidence)
+                    update_gate_pool_entry(url, gate_type=detected_type, confidence=confidence)
 
-                if detected_type == "braintree":
-                    result = await loop.run_in_executor(None, setup_braintree_from_url, url)
-                else:
-                    result = await loop.run_in_executor(None, setup_gate_from_url, url)
+                    if detected_type == "braintree":
+                        result = await loop.run_in_executor(None, setup_braintree_from_url, url)
+                    else:
+                        result = await loop.run_in_executor(None, setup_gate_from_url, url)
 
-                update_gate_pool_entry(url, setup_result=result)
+                    update_gate_pool_entry(url, setup_result=result)
 
-                if result.get("success"):
-                    update_gate_pool_entry(url, status="ready")
-                    ready_count += 1
-                    if first_ready_url is None:
-                        first_ready_url = url
-                        first_ready_gate_type = detected_type
-                        first_ready_settings = get_all_gate_settings(detected_type).copy()
-                        active_cid = get_active_config_id()
-                        set_config_gate_type(active_cid, detected_type)
-                        for k, v in first_ready_settings.items():
-                            set_config_setting(active_cid, k, v)
-                        enable_config(active_cid)
-                        set_gate_enabled(detected_type, True)
-                else:
-                    errors = result.get("errors", [])
-                    err_msg = errors[0] if errors else "Setup failed"
-                    update_gate_pool_entry(url, status="failed", error=err_msg)
+                    if result.get("success"):
+                        update_gate_pool_entry(url, status="ready")
+                        ready_count += 1
+                        if first_ready_url is None:
+                            first_ready_url = url
+                            first_ready_gate_type = detected_type
+                            first_ready_settings = get_all_gate_settings(detected_type).copy()
+                            active_cid = get_active_config_id()
+                            set_config_gate_type(active_cid, detected_type)
+                            for k, v in first_ready_settings.items():
+                                set_config_setting(active_cid, k, v)
+                            enable_config(active_cid)
+                            set_gate_enabled(detected_type, True)
+                    else:
+                        errors = result.get("errors", [])
+                        err_msg = errors[0] if errors else "Setup failed"
+                        update_gate_pool_entry(url, status="failed", error=err_msg)
+                        fail_count += 1
+
+                except Exception as e:
+                    update_gate_pool_entry(url, status="failed", error=str(e)[:60])
                     fail_count += 1
 
-            except Exception as e:
-                update_gate_pool_entry(url, status="failed", error=str(e)[:60])
-                fail_count += 1
+                if (i + 1) % 10 == 0 and _autogates_running:
+                    try:
+                        last_url_short = url[:35] + "..." if len(url) > 35 else url
+                        last_status = "ready" if result.get("success") else "failed"
+                        last_form = result.get("form_type", "?") if isinstance(result, dict) else "?"
+                        await message.reply(
+                            f"<b>⏳  PROGRESS {i+1}/{total}</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"✅ Ready: <code>{ready_count}</code>\n"
+                            f"❌ Failed: <code>{fail_count}</code>\n"
+                            f"⏳ Remaining: <code>{total - i - 1}</code>\n\n"
+                            f"📄 Last: <code>{last_url_short}</code>\n"
+                            f"   Status: {last_status} · Form: {last_form}\n\n"
+                            f"<code>━━ H@0 ━━</code>",
+                            parse_mode='HTML'
+                        )
+                    except Exception:
+                        pass
 
-            if (i + 1) % 10 == 0 and _autogates_running:
-                try:
-                    last_url_short = url[:35] + "..." if len(url) > 35 else url
-                    last_status = "ready" if result.get("success") else "failed"
-                    last_form = result.get("form_type", "?") if isinstance(result, dict) else "?"
-                    await message.reply(
-                        f"<b>⏳  PROGRESS {i+1}/{total}</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"✅ Ready: <code>{ready_count}</code>\n"
-                        f"❌ Failed: <code>{fail_count}</code>\n"
-                        f"⏳ Remaining: <code>{total - i - 1}</code>\n\n"
-                        f"📄 Last: <code>{last_url_short}</code>\n"
-                        f"   Status: {last_status} · Form: {last_form}\n\n"
-                        f"<code>━━ H@0 ━━</code>",
-                        parse_mode='HTML'
-                    )
-                except Exception:
-                    pass
+            if first_ready_settings and first_ready_gate_type:
+                active_cid = get_active_config_id()
+                set_config_gate_type(active_cid, first_ready_gate_type)
+                for k, v in first_ready_settings.items():
+                    set_config_setting(active_cid, k, v)
 
-        if first_ready_settings and first_ready_gate_type:
-            active_cid = get_active_config_id()
-            set_config_gate_type(active_cid, first_ready_gate_type)
-            for k, v in first_ready_settings.items():
-                set_config_setting(active_cid, k, v)
+            pool_stats = get_gate_pool_stats()
+            pool = get_gate_pool()
 
-        _autogates_running = False
+            ready_lines = ""
+            fail_lines = ""
+            ready_count_display = 0
+            fail_count_display = 0
+            for url, info in pool.items():
+                if info["status"] == "ready" and ready_count_display < 15:
+                    gt = (info.get("gate_type") or "stripe").upper()
+                    conf = info.get("confidence", "?")
+                    short_url = url[:45] + "..." if len(url) > 45 else url
+                    ready_lines += f"  ✅ <code>{short_url}</code> [{gt}/{conf}]\n"
+                    ready_count_display += 1
+                elif info["status"] == "failed" and fail_count_display < 10:
+                    err = info.get("last_error", "unknown")[:35]
+                    short_url = url[:35] + "..." if len(url) > 35 else url
+                    fail_lines += f"  ❌ <code>{short_url}</code>\n      <i>{err}</i>\n"
+                    fail_count_display += 1
 
-        pool_stats = get_gate_pool_stats()
-        pool = get_gate_pool()
+            first_gate_line = ""
+            if first_ready_url:
+                short = first_ready_url[:45] + "..." if len(first_ready_url) > 45 else first_ready_url
+                first_gate_line = f"\n🎯 Active: <code>{short}</code>\n"
 
-        ready_lines = ""
-        fail_lines = ""
-        count = 0
-        for url, info in pool.items():
-            if info["status"] == "ready" and count < 15:
-                gt = (info.get("gate_type") or "stripe").upper()
-                conf = info.get("confidence", "?")
-                short_url = url[:45] + "..." if len(url) > 45 else url
-                ready_lines += f"  ✅ <code>{short_url}</code> [{gt}/{conf}]\n"
-                count += 1
-            elif info["status"] == "failed" and count < 25:
-                err = info.get("last_error", "unknown")[:35]
-                short_url = url[:35] + "..." if len(url) > 35 else url
-                fail_lines += f"  ❌ <code>{short_url}</code>\n      <i>{err}</i>\n"
-                count += 1
-
-        first_gate_line = ""
-        if first_ready_url:
-            short = first_ready_url[:45] + "..." if len(first_ready_url) > 45 else first_ready_url
-            first_gate_line = f"\n🎯 Active: <code>{short}</code>\n"
-
-        await message.reply(
-            "<b>🏁  AUTO-GATES COMPLETE</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊 Total: <code>{pool_stats['total']}</code>\n"
-            f"✅ Ready: <code>{pool_stats['ready']}</code>\n"
-            f"❌ Failed: <code>{pool_stats['failed']}</code>\n"
-            f"{first_gate_line}\n"
-            + (f"<b>✅  READY GATES</b>\n{ready_lines}\n" if ready_lines else "")
-            + (f"<b>❌  FAILED</b>\n{fail_lines}\n" if fail_lines else "")
-            + "\n<b>💡  NEXT</b>\n"
-            "  • <code>/gatepool</code> — View full pool\n"
-            "  • <code>/testcard</code> — Quick gate test\n"
-            "  • <code>/chk CC|MM|YY|CVV</code> — Check a card\n"
-            "  • <code>/autogates reset</code> — Re-scan all\n\n"
-            "<code>━━ H@0 ━━</code>",
-            parse_mode='HTML'
-        )
+            await message.reply(
+                "<b>🏁  AUTO-GATES COMPLETE</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📊 Total: <code>{pool_stats['total']}</code>\n"
+                f"✅ Ready: <code>{pool_stats['ready']}</code>\n"
+                f"❌ Failed: <code>{pool_stats['failed']}</code>\n"
+                f"{first_gate_line}\n"
+                + (f"<b>✅  READY GATES</b>\n{ready_lines}\n" if ready_lines else "")
+                + (f"<b>❌  FAILED</b>\n{fail_lines}\n" if fail_lines else "")
+                + "\n<b>💡  NEXT</b>\n"
+                "  • <code>/gatepool</code> — View full pool\n"
+                "  • <code>/testcard</code> — Quick gate test\n"
+                "  • <code>/chk CC|MM|YY|CVV</code> — Check a card\n"
+                "  • <code>/autogates reset</code> — Re-scan all\n\n"
+                "<code>━━ H@0 ━━</code>",
+                parse_mode='HTML'
+            )
+        finally:
+            _autogates_running = False
 
     @dp.message_handler(commands=['gatepool'])
     async def cmd_gatepool(message: Message):

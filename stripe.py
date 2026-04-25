@@ -857,19 +857,23 @@ def _extract_payment_intent_from_response(rj):
         return None
     if rj.get("object") == "payment_intent":
         return rj
-    for key in ("payment_intent", "paymentIntent", "intent", "data"):
+    pi_statuses = (
+        "succeeded", "requires_action", "requires_payment_method",
+        "requires_confirmation", "processing", "canceled"
+    )
+    for key in ("payment_intent", "paymentIntent", "intent"):
         obj = rj.get(key)
         if isinstance(obj, dict) and obj.get("object") == "payment_intent":
             return obj
-        if isinstance(obj, dict) and obj.get("status") in (
-            "succeeded", "requires_action", "requires_payment_method",
-            "requires_confirmation", "processing", "canceled"
-        ):
+        if isinstance(obj, dict) and obj.get("status") in pi_statuses:
             return obj
-    if rj.get("status") in (
-        "succeeded", "requires_action", "requires_payment_method",
-        "requires_confirmation", "processing", "canceled"
-    ) and rj.get("id", "").startswith("pi_"):
+    data_obj = rj.get("data")
+    if isinstance(data_obj, dict):
+        if data_obj.get("object") == "payment_intent":
+            return data_obj
+        if data_obj.get("id", "").startswith("pi_") and data_obj.get("status") in pi_statuses:
+            return data_obj
+    if rj.get("status") in pi_statuses and rj.get("id", "").startswith("pi_"):
         return rj
     stripe_err = rj.get("stripe_error", {})
     if isinstance(stripe_err, dict) and stripe_err.get("payment_intent"):
@@ -1706,7 +1710,7 @@ def _detect_form_type(page_html, soup):
     if 'classy.org' in html_lower or 'classy-widget' in html_lower:
         return "classy", "Classy.org donation"
 
-    if 'networkforgood' in html_lower or 'nfg' in html_lower:
+    if 'networkforgood' in html_lower or 'network for good' in html_lower:
         return "networkforgood", "Network for Good"
 
     if 'actionnetwork.org' in html_lower or 'action_network' in html_lower:
