@@ -1064,26 +1064,52 @@ def _parse_token_error(err):
 
     logger.info(f"Token response: {code or decline_code or 'processed'}")
 
-    if "insufficient" in check:
+    if "api_key_expired" in check or "invalid_api_key" in check:
+        return "error", "Invalid/Expired API Key"
+    elif "resource_missing" in check:
+        return "error", "Resource Missing (Gate Error)"
+    elif "rate_limit" in check:
+        return "error", "Rate Limited"
+    elif "parameter_missing" in check:
+        return "error", "Missing Parameter (Gate Error)"
+    elif "token_already_used" in check:
+        return "error", "Token Already Used"
+    elif "payment_intent_unexpected_state" in check:
+        return "error", "PI Unexpected State"
+    elif "amount_too_small" in check:
+        return "error", "Amount Too Small"
+    elif "amount_too_large" in check:
+        return "error", "Amount Too Large"
+    elif "balance_insufficient" in check:
+        return "live", "Balance Insufficient (Live)"
+    elif "not_sufficient_funds" in check or "insufficient" in check:
         return "live", "Insufficient Funds (Live)"
     elif "authentication_required" in check or "requires_action" in check:
         return "live", "3DS Required (Card Live)"
+    elif "setup_intent_authentication_failure" in check:
+        return "live", "Auth Failed (Card Live)"
     elif "approve_with_id" in check:
         return "live", "Approved with ID (Live)"
     elif "card_velocity_exceeded" in check:
         return "live", "Activity Limit (Live)"
     elif "withdrawal_count_limit_exceeded" in check:
         return "live", "Limit Exceeded (Live)"
-    elif "expired" in check:
-        return "declined", "Expired Card"
-    elif "incorrect_number" in check or ("incorrect" in check and "number" in check):
-        return "declined", "Invalid Card Number"
-    elif "invalid" in check and "number" in check:
-        return "declined", "Invalid Card Number"
+    elif "exceeds_approval_amount_limit" in check:
+        return "live", "Exceeds Limit (Live)"
+    elif "cvc_check" in check and "fail" in check:
+        return "live", "CVC Check Failed (Live)"
     elif "incorrect_cvc" in check or "security code" in check:
         return "live", "CVV Declined (Card Live)"
     elif "incorrect_zip" in check:
         return "live", "AVS Mismatch (Card Live)"
+    elif "expired_card" in check or ("expired" in check and "api_key" not in check):
+        return "declined", "Expired Card"
+    elif "incorrect_number" in check or ("incorrect" in check and "number" in check):
+        return "declined", "Invalid Card Number"
+    elif "invalid_expiry" in check:
+        return "declined", "Invalid Expiry"
+    elif "invalid" in check and "number" in check:
+        return "declined", "Invalid Card Number"
     elif "stolen_card" in check:
         return "declined", "Card Reported Stolen"
     elif "lost_card" in check:
@@ -1096,6 +1122,8 @@ def _parse_token_error(err):
         return "declined", "Pick Up Card"
     elif "restricted_card" in check:
         return "declined", "Restricted Card"
+    elif "testmode_decline" in check or "test_mode" in check:
+        return "declined", "Test Mode Decline"
     elif "live_mode_test_card" in check or "testmode" in check:
         return "declined", "Test Card Rejected"
     elif "processing_error" in check:
@@ -1103,10 +1131,6 @@ def _parse_token_error(err):
     elif "card_declined" in check:
         dc = decline_code if decline_code and decline_code != "card_declined" else ""
         return "declined", f"Card Declined ({dc})" if dc else "Card Declined"
-    elif "invalid_expiry" in check:
-        return "declined", "Invalid Expiry"
-    elif "incorrect_zip" in check:
-        return "declined", "Declined - AVS"
     elif "security_violation" in check:
         return "declined", "Security Violation"
     elif "issuer_not_available" in check or "call_issuer" in check:
@@ -1127,8 +1151,14 @@ def _parse_token_error(err):
         return "declined", "Revoked Authorization"
     elif "revocation_of_authorization" in check:
         return "declined", "Revoked Authorization"
-    elif "not_sufficient_funds" in check:
-        return "live", "Insufficient Funds (Live)"
+    elif "allowable_number_of_pin_tries_exceeded" in check or "pin_tries_exceeded" in check:
+        return "declined", "PIN Tries Exceeded"
+    elif "invalid_pin" in check:
+        return "declined", "Invalid PIN"
+    elif "offline_pin_required" in check:
+        return "declined", "Offline PIN Required"
+    elif "online_or_offline_pin_required" in check:
+        return "declined", "PIN Required"
     elif "pin" in check and ("incorrect" in check or "invalid" in check or "tries" in check):
         return "declined", "PIN Error"
     elif "merchant_blacklist" in check:
@@ -1145,46 +1175,12 @@ def _parse_token_error(err):
         return "declined", "Stop Payment Order"
     elif "refer_to_card_issuer" in check or "refer_to_issuer" in check:
         return "declined", "Refer to Card Issuer"
-    elif "allowable_number_of_pin_tries_exceeded" in check or "pin_tries_exceeded" in check:
-        return "declined", "PIN Tries Exceeded"
-    elif "offline_pin_required" in check:
-        return "declined", "Offline PIN Required"
-    elif "online_or_offline_pin_required" in check:
-        return "declined", "PIN Required"
-    elif "exceeds_approval_amount_limit" in check:
-        return "live", "Exceeds Limit (Live)"
     elif "card_not_supported" in check:
         return "declined", "Card Not Supported"
-    elif "invalid_pin" in check:
-        return "declined", "Invalid PIN"
-    elif "testmode_decline" in check or "test_mode" in check:
-        return "declined", "Test Mode Decline"
-    elif "resource_missing" in check:
-        return "error", "Resource Missing (Gate Error)"
-    elif "rate_limit" in check:
-        return "error", "Rate Limited"
-    elif "api_key_expired" in check or "invalid_api_key" in check:
-        return "error", "Invalid/Expired API Key"
-    elif "parameter_missing" in check:
-        return "error", "Missing Parameter (Gate Error)"
-    elif "token_already_used" in check:
-        return "error", "Token Already Used"
-    elif "payment_intent_unexpected_state" in check:
-        return "error", "PI Unexpected State"
-    elif "amount_too_small" in check:
-        return "error", "Amount Too Small"
-    elif "amount_too_large" in check:
-        return "error", "Amount Too Large"
-    elif "balance_insufficient" in check:
-        return "live", "Balance Insufficient (Live)"
     elif "card_account_closed" in check or "account_closed" in check:
         return "declined", "Account Closed"
     elif "country_code_invalid" in check:
         return "declined", "Invalid Country Code"
-    elif "cvc_check" in check and "fail" in check:
-        return "live", "CVC Check Failed (Live)"
-    elif "setup_intent_authentication_failure" in check:
-        return "live", "Auth Failed (Card Live)"
     else:
         return "declined", msg[:80] if msg else "Card Declined"
 
